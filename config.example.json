@@ -1,0 +1,13 @@
+{
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "qwen3.5:35b-a3b",
+    "ssh_tunnel_host": "user@YOUR_DGX_HOST",
+    "ssh_key_path": "",
+    "tunnel_idle_timeout": 900,
+    "cloud_api_key": "YOUR_CLOUD_API_KEY_HERE",
+    "cloud_api_base": "https://api.minimax.io/v1",
+    "cloud_models": [
+        "MiniMax-M2.7",
+        "MiniMax-M2.5"
+    ]
+}

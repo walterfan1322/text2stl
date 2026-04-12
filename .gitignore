@@ -1,0 +1,25 @@
+# Logs
+*.log
+server-err.log
+server_stdout.log
+service.log
+
+# Output / generated files
+output/
+*.stl
+!phone_stand.stl
+
+# Backups
+*.bak*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Config with secrets
+config.json
+
+# OS
+Thumbs.db
+.DS_Store

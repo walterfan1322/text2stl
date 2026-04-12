@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Text2STL - 自然語言 3D 建模</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0f0f0f;
+            color: #e0e0e0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            padding: 12px 16px;
+            background: #1a1a2e;
+            border-bottom: 1px solid #333;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            background: linear-gradient(135deg, #00d2ff, #7b2ff7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        header span { font-size: 13px; color: #888; }
+        .main {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+        .sidebar {
+            width: 420px;
+            min-width: 320px;
+            background: #141420;
+            border-right: 1px solid #333;
+            display: flex;
+            flex-direction: column;
+            padding: 16px;
+            gap: 12px;
+            overflow-y: auto;
+        }
+        .sidebar label {
+            font-size: 13px;
+            font-weight: 500;
+            color: #aaa;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        textarea {
+            flex: none;
+            height: 140px;
+            background: #1e1e30;
+            border: 1px solid #444;
+            border-radius: 8px;
+            color: #e0e0e0;
+            font-size: 15px;
+            padding: 12px;
+            resize: vertical;
+            font-family: inherit;
+            transition: border-color 0.2s;
+        }
+        textarea:focus { outline: none; border-color: #7b2ff7; }
+        select {
+            background: #1e1e30;
+            border: 1px solid #444;
+            border-radius: 8px;
+            color: #e0e0e0;
+            font-size: 14px;
+            padding: 8px 12px;
+            width: 100%;
+            max-width: 100%;
+        }
+        button.generate {
+            padding: 12px;
+            background: linear-gradient(135deg, #7b2ff7, #00d2ff);
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        button.generate:hover { opacity: 0.9; }
+        button.generate:disabled { opacity: 0.5; cursor: not-allowed; }
+        .code-section { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+        .code-section pre {
+            flex: 1;
+            background: #1e1e30;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 12px;
+            overflow: auto;
+            font-size: 13px;
+            line-height: 1.5;
+            font-family: "SF Mono", "Fira Code", monospace;
+            color: #a0d0a0;
+            white-space: pre-wrap;
+        }
+        .actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .actions button {
+            flex: 1;
+            padding: 8px;
+            background: #2a2a40;
+            border: 1px solid #444;
+            border-radius: 6px;
+            color: #ccc;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        .actions button:hover { background: #3a3a50; }
+        .viewer {
+            flex: 1;
+            position: relative;
+            background: #1a1a1a;
+        }
+        #three-canvas { width: 100%; height: 100%; display: block; }
+        .status {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            color: #666;
+            font-size: 14px;
+            pointer-events: none;
+        }
+        .status.hidden { display: none; }
+        .spinner {
+            width: 40px; height: 40px;
+            border: 3px solid #333;
+            border-top-color: #7b2ff7;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin: 0 auto 12px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .error { color: #ff6b6b; }
+
+        /* Responsive: mobile & tablet */
+        @media (max-width: 900px) {
+            .main {
+                flex-direction: column;
+            }
+            .sidebar {
+                width: 100%;
+                min-width: unset;
+                max-height: 50vh;
+                border-right: none;
+                border-bottom: 1px solid #333;
+                padding: 12px;
+                gap: 10px;
+            }
+            .viewer {
+                min-height: 300px;
+            }
+            header {
+                padding: 10px 14px;
+                flex-wrap: wrap;
+            }
+            header h1 { font-size: 18px; }
+            header span { font-size: 11px; }
+            textarea { height: 80px; font-size: 14px; }
+            .code-section pre { max-height: 120px; }
+            .actions { flex-wrap: wrap; }
+            .actions button { min-width: 45%; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Text2STL</h1>
+        <span>自然語言 3D 建模 — 輸入描述，生成 STL</span>
+        <span id="tunnel-badge" style="margin-left:auto;font-size:11px;padding:3px 10px;border-radius:12px;background:#333;color:#888;">DGX: 待機</span>
+    </header>
+    <div class="main">
+        <div class="sidebar">
+            <div>
+                <label>模型</label>
+                <select id="model-select"><option>載入中...</option></select>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:6px;">
+                <label>描述你想要的 3D 物件</label>
+                <textarea id="prompt" placeholder="例如：一個直徑 50mm、高 80mm 的杯子，帶有把手&#10;&#10;一個齒輪，20 齒，模數 2&#10;&#10;一個手機支架"></textarea>
+            </div>
+            <button class="generate" id="btn-generate" onclick="generate()">生成 3D 模型</button>
+            <div id="refine-section" style="display:none;flex-direction:column;gap:6px;">
+                <div id="gen-info-box" style="display:none;background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.5;color:#aaa;max-height:140px;overflow-y:auto;">
+                </div>
+                <div id="review-box" style="display:none;background:#1e1e30;border:1px solid #444;border-radius:8px;padding:10px;font-size:13px;line-height:1.5;color:#ccc;max-height:120px;overflow-y:auto;">
+                </div>
+                <div id="iteration-badge" style="display:none;font-size:12px;color:#888;text-align:center;">
+                    迭代次數: <span id="iteration-count">0</span>
+                </div>
+                <div style="display:flex;gap:8px;">
+                    <button class="generate" id="btn-auto-review" onclick="autoReview()" style="flex:1;background:linear-gradient(135deg,#10b981,#06b6d4);font-size:14px;padding:10px;">🔍 自動審查修正</button>
+                </div>
+                <label style="margin-top:4px;">手動修改意見</label>
+                <textarea id="refine-input" style="height:60px;" placeholder="例如：靠背再傾斜一點、底座加厚、加一個凹槽放手機..."></textarea>
+                <button class="generate" id="btn-refine" onclick="refine()" style="background:linear-gradient(135deg,#f59e0b,#f97316);font-size:14px;padding:10px;">🔄 依意見修正</button>
+            </div>
+            <div class="code-section">
+                <label>Python 程式碼</label>
+                <pre id="code-output"># 程式碼會在這裡顯示...</pre>
+            </div>
+            <div class="actions">
+                <button onclick="downloadSTL()">下載 STL</button>
+                <button onclick="copyCode()">複製程式碼</button>
+            </div>
+        </div>
+        <div class="viewer">
+            <canvas id="three-canvas"></canvas>
+            <div class="status" id="status">
+                <p style="font-size:48px;margin-bottom:12px;">🎨</p>
+                <p>輸入描述並點擊「生成 3D 模型」</p>
+            </div>
+        </div>
+    </div>
+
+<script>
+// === Three.js STL Viewer ===
+let scene, camera, renderer, controls, currentMesh;
+let phoneMesh = null;
+let showPhone = false;
+let isRotating = true;
+let isDragging = false;
+let previousMousePosition = { x: 0, y: 0 };
+let currentJobId = null;
+
+function initThree() {
+    const canvas = document.getElementById('three-canvas');
+    const container = canvas.parentElement;
+
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a1a);
+
+    camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 10000);
+    camera.position.set(100, 80, 100);
+
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+
+    // Lights
+    const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+    scene.add(ambientLight);
+
+    const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight1.position.set(1, 1, 1);
+    scene.add(dirLight1);
+
+    const dirLight2 = new THREE.DirectionalLight(0x7b2ff7, 0.3);
+    dirLight2.position.set(-1, -0.5, -1);
+    scene.add(dirLight2);
+
+    // Grid
+    const grid = new THREE.GridHelper(200, 20, 0x333333, 0x222222);
+    scene.add(grid);
+
+    // Mouse controls
+    canvas.addEventListener('mousedown', (e) => { isDragging = true; previousMousePosition = { x: e.clientX, y: e.clientY }; isRotating = false; });
+    canvas.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        const deltaX = e.clientX - previousMousePosition.x;
+        const deltaY = e.clientY - previousMousePosition.y;
+        const rotSpeed = 0.005;
+        if (currentMesh) {
+            currentMesh.rotation.y += deltaX * rotSpeed;
+            currentMesh.rotation.x += deltaY * rotSpeed;
+        }
+        previousMousePosition = { x: e.clientX, y: e.clientY };
+    });
+    canvas.addEventListener('mouseup', () => { isDragging = false; });
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        camera.position.multiplyScalar(e.deltaY > 0 ? 1.1 : 0.9);
+    }, { passive: false });
+
+    window.addEventListener('resize', () => {
+        camera.aspect = container.clientWidth / container.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(container.clientWidth, container.clientHeight);
+    });
+
+    animate();
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    if (currentMesh && isRotating) {
+        currentMesh.rotation.y += 0.005;
+    }
+    renderer.render(scene, camera);
+}
+
+function loadSTL(url) {
+    // Simple binary STL parser
+    fetch(url)
+        .then(r => r.arrayBuffer())
+        .then(buffer => {
+            const geometry = parseSTL(buffer);
+            if (currentMesh) scene.remove(currentMesh);
+
+            const material = new THREE.MeshPhongMaterial({
+                color: 0x7b8fff,
+                specular: 0x444444,
+                shininess: 30,
+                flatShading: false,
+            });
+            currentMesh = new THREE.Mesh(geometry, material);
+
+            // Center and scale
+            geometry.computeBoundingBox();
+            const box = geometry.boundingBox;
+            const center = new THREE.Vector3();
+            box.getCenter(center);
+            geometry.translate(-center.x, -center.y, -center.z);
+
+            const size = new THREE.Vector3();
+            box.getSize(size);
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const scale = 80 / maxDim;
+            currentMesh.scale.set(scale, scale, scale);
+
+            scene.add(currentMesh);
+            isRotating = true;
+
+            camera.position.set(100, 80, 100);
+            camera.lookAt(0, 0, 0);
+        });
+}
+
+function parseSTL(buffer) {
+    const dv = new DataView(buffer);
+    // Check if ASCII or binary
+    const header = new Uint8Array(buffer, 0, 5);
+    const isAscii = String.fromCharCode(...header) === 'solid';
+
+    if (!isAscii || buffer.byteLength < 84) {
+        // Binary STL
+        const numTriangles = dv.getUint32(80, true);
+        const geometry = new THREE.BufferGeometry();
+        const vertices = new Float32Array(numTriangles * 9);
+        const normals = new Float32Array(numTriangles * 9);
+
+        let offset = 84;
+        for (let i = 0; i < numTriangles; i++) {
+            const nx = dv.getFloat32(offset, true); offset += 4;
+            const ny = dv.getFloat32(offset, true); offset += 4;
+            const nz = dv.getFloat32(offset, true); offset += 4;
+
+            for (let j = 0; j < 3; j++) {
+                const idx = i * 9 + j * 3;
+                vertices[idx]     = dv.getFloat32(offset, true); offset += 4;
+                vertices[idx + 1] = dv.getFloat32(offset, true); offset += 4;
+                vertices[idx + 2] = dv.getFloat32(offset, true); offset += 4;
+                normals[idx]     = nx;
+                normals[idx + 1] = ny;
+                normals[idx + 2] = nz;
+            }
+            offset += 2; // attribute byte count
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+        geometry.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+        return geometry;
+    }
+
+    // ASCII STL fallback
+    const text = new TextDecoder().decode(buffer);
+    const vertexPattern = /vertex\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)/g;
+    const verts = [];
+    let match;
+    while ((match = vertexPattern.exec(text)) !== null) {
+        verts.push(parseFloat(match[1]), parseFloat(match[2]), parseFloat(match[3]));
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+    geometry.computeVertexNormals();
+    return geometry;
+}
+
+// === API ===
+async function generate() {
+    const prompt = document.getElementById('prompt').value.trim();
+    if (!prompt) return;
+
+    const btn = document.getElementById('btn-generate');
+    const statusEl = document.getElementById('status');
+    const codeEl = document.getElementById('code-output');
+
+    btn.disabled = true;
+    btn.textContent = '生成中...';
+    statusEl.className = 'status';
+    statusEl.innerHTML = '<div class="spinner"></div><p>正在生成 3D 模型，請稍候...</p><p style="font-size:12px;color:#555;margin-top:8px;">① 搜尋參考資料 → ② 補齊描述 → ③ 生成程式碼 → STL</p>';
+    codeEl.textContent = '# 正在生成...';
+
+    try {
+        const model = document.getElementById('model-select').value;
+        const resp = await fetch('/api/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, model }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Generation failed');
+        }
+
+        const data = await resp.json();
+        currentJobId = data.id;
+        codeEl.textContent = data.code;
+        currentCode = data.code;
+        enrichedPrompt = data.enriched_prompt || '';
+        iterationCount = 0;
+        document.getElementById('iteration-count').textContent = '0';
+        document.getElementById('iteration-badge').style.display = 'none';
+        document.getElementById('review-box').style.display = 'none';
+        // Hide the 3D viewer overlay — don't block the model
+        statusEl.className = 'status hidden';
+
+        // Show search + enriched info in the SIDEBAR gen-info-box
+        const genInfoBox = document.getElementById('gen-info-box');
+        let infoHtml = '<div style="color:#4ade80;font-weight:bold;margin-bottom:4px;">✅ 生成成功</div>';
+        if (data.search_info) {
+            infoHtml += `<details style="font-size:11px;color:#888;margin-bottom:4px;"><summary style="cursor:pointer;color:#aaa;">🔍 搜尋到的參考資料</summary><div style="margin-top:4px;white-space:pre-wrap;">${data.search_info}</div></details>`;
+        }
+        if (data.enriched_prompt) {
+            infoHtml += `<details style="font-size:11px;color:#888;"><summary style="cursor:pointer;color:#aaa;">📝 AI 補齊的描述</summary><div style="margin-top:4px;">${data.enriched_prompt}</div></details>`;
+        }
+        genInfoBox.innerHTML = infoHtml;
+        genInfoBox.style.display = 'block';
+
+        loadSTL(data.stl_url);
+        document.getElementById('refine-section').style.display = 'flex';
+    } catch (e) {
+        statusEl.innerHTML = `<p class="error">生成失敗</p><p class="error" style="font-size:13px;margin-top:8px;">${e.message}</p>`;
+        codeEl.textContent = '# 生成失敗: ' + e.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '生成 3D 模型';
+    }
+}
+
+let currentCode = '';
+let enrichedPrompt = '';
+let iterationCount = 0;
+
+async function autoReview() {
+    if (!currentJobId || !currentCode) return;
+
+    const btn = document.getElementById('btn-auto-review');
+    const btnRefine = document.getElementById('btn-refine');
+    const statusEl = document.getElementById('status');
+    const codeEl = document.getElementById('code-output');
+    const reviewBox = document.getElementById('review-box');
+
+    btn.disabled = true;
+    btnRefine.disabled = true;
+    btn.textContent = '🔍 審查修正中...';
+    statusEl.className = 'status';
+    statusEl.innerHTML = '<div class="spinner"></div><p>LLM 正在審查程式碼並修正...</p>';
+
+    try {
+        const model = document.getElementById('model-select').value;
+        const resp = await fetch('/api/auto-review', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                job_id: currentJobId,
+                current_code: currentCode,
+                enriched_prompt: enrichedPrompt,
+                model,
+            }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Auto-review failed');
+        }
+
+        const data = await resp.json();
+        iterationCount++;
+        document.getElementById('iteration-count').textContent = iterationCount;
+        document.getElementById('iteration-badge').style.display = 'block';
+
+        // Show review result
+        reviewBox.style.display = 'block';
+        if (data.changed) {
+            reviewBox.innerHTML = `<div style="color:#f59e0b;font-weight:bold;margin-bottom:4px;">📝 第 ${iterationCount} 次審查意見：</div><div>${data.review.replace(/\n/g, '<br>')}</div><div style="color:#4ade80;margin-top:6px;">✅ 已自動修正</div>`;
+            currentJobId = data.id;
+            currentCode = data.code;
+            codeEl.textContent = data.code;
+            loadSTL(data.stl_url + '?t=' + Date.now());
+            statusEl.className = 'status hidden';
+        } else {
+            reviewBox.innerHTML = `<div style="color:#4ade80;font-weight:bold;margin-bottom:4px;">第 ${iterationCount} 次審查結果：</div><div>${data.review.replace(/\n/g, '<br>')}</div>`;
+            statusEl.className = 'status hidden';
+        }
+    } catch (e) {
+        statusEl.innerHTML = `<p class="error">審查失敗</p><p class="error" style="font-size:13px;margin-top:8px;">${e.message}</p>`;
+    } finally {
+        btn.disabled = false;
+        btnRefine.disabled = false;
+        btn.textContent = '🔍 自動審查修正';
+    }
+}
+
+async function refine() {
+    const feedback = document.getElementById('refine-input').value.trim();
+    if (!feedback || !currentJobId) return;
+
+    const btn = document.getElementById('btn-refine');
+    const statusEl = document.getElementById('status');
+    const codeEl = document.getElementById('code-output');
+
+    btn.disabled = true;
+    btn.textContent = '修正中...';
+    statusEl.className = 'status';
+    statusEl.innerHTML = '<div class="spinner"></div><p>正在修正模型...</p>';
+
+    try {
+        const model = document.getElementById('model-select').value;
+        const resp = await fetch('/api/refine', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                job_id: currentJobId,
+                feedback: feedback,
+                current_code: currentCode,
+                model,
+            }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || 'Refine failed');
+        }
+
+        const data = await resp.json();
+        currentJobId = data.id;
+        currentCode = data.code;
+        codeEl.textContent = data.code;
+        iterationCount++;
+        document.getElementById('iteration-count').textContent = iterationCount;
+        document.getElementById('iteration-badge').style.display = 'block';
+        const reviewBox = document.getElementById('review-box');
+        reviewBox.style.display = 'block';
+        reviewBox.innerHTML = `<div style="color:#f59e0b;font-weight:bold;margin-bottom:4px;">✏️ 第 ${iterationCount} 次手動修正：</div><div>${feedback}</div><div style="color:#4ade80;margin-top:6px;">✅ 修正完成</div>`;
+        statusEl.className = 'status hidden';
+
+        loadSTL(data.stl_url + '?t=' + Date.now());
+        document.getElementById('refine-input').value = '';
+    } catch (e) {
+        statusEl.innerHTML = `<p class="error">修正失敗</p><p class="error" style="font-size:13px;margin-top:8px;">${e.message}</p>`;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '🔄 依意見修正';
+    }
+}
+
+function downloadSTL() {
+    if (!currentJobId) return alert('尚未生成模型');
+    const a = document.createElement('a');
+    a.href = `/api/download/${currentJobId}`;
+    a.download = `model-${currentJobId}.stl`;
+    a.click();
+}
+
+function copyCode() {
+    const code = document.getElementById('code-output').textContent;
+    navigator.clipboard.writeText(code);
+}
+
+async function loadModels() {
+    try {
+        const resp = await fetch('/api/models');
+        const data = await resp.json();
+        const select = document.getElementById('model-select');
+        select.innerHTML = '';
+        (data.models || []).forEach(m => {
+            const opt = document.createElement('option');
+            opt.value = m;
+            opt.textContent = m;
+            if (m === 'qwen3.5:35b-a3b') opt.selected = true;
+            select.appendChild(opt);
+        });
+    } catch (e) {
+        console.error('Failed to load models:', e);
+    }
+}
+
+// Tunnel status polling
+async function updateTunnelStatus() {
+    const badge = document.getElementById('tunnel-badge');
+    try {
+        const resp = await fetch('/api/tunnel-status');
+        const data = await resp.json();
+        if (data.alive) {
+            const idle = data.idle_seconds;
+            const remaining = Math.max(0, data.timeout - idle);
+            const min = Math.floor(remaining / 60);
+            const sec = remaining % 60;
+            badge.textContent = `DGX: 連線中 (${min}:${String(sec).padStart(2,'0')} 後釋放)`;
+            badge.style.background = '#1a3a1a';
+            badge.style.color = '#4ade80';
+        } else {
+            badge.textContent = 'DGX: 待機';
+            badge.style.background = '#333';
+            badge.style.color = '#888';
+        }
+    } catch (e) {
+        badge.textContent = 'DGX: --';
+    }
+}
+setInterval(updateTunnelStatus, 5000);
+
+// Pre-warm model on page load (background, no UI block)
+async function warmupModel() {
+    const badge = document.getElementById('tunnel-badge');
+    badge.textContent = 'DGX: 載入模型中...';
+    badge.style.background = '#3a3a1a';
+    badge.style.color = '#facc15';
+    try {
+        const model = document.getElementById('model-select').value;
+        await fetch('/api/warmup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: model || null }),
+        });
+    } catch (e) {
+        console.error('Warmup failed:', e);
+    }
+    updateTunnelStatus();
+}
+
+// Init
+initThree();
+loadModels().then(() => warmupModel());
+updateTunnelStatus();
+</script>
+</body>
+</html>
