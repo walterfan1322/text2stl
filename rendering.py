@@ -66,6 +66,16 @@ def render_stl_views(
 
     try:
         paths = _render_with_trimesh(stl_path, out_dir, resolution, angles)
+        # On Windows hosts that fall through to GDI Generic (OpenGL 1.1),
+        # pyglet writes ~1.5KB blank PNGs without raising. Detect this by
+        # checking the LARGEST view's size — if every angle is near-empty,
+        # the renderer is broken and matplotlib must take over.
+        if paths and max(p.stat().st_size for p in paths) < 4000:
+            log.warning(
+                f"trimesh produced near-blank PNGs (max {max(p.stat().st_size for p in paths)} bytes); "
+                f"falling back to matplotlib"
+            )
+            paths = []
         if paths:
             return paths
     except Exception as e:
