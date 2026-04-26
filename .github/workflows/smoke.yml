@@ -43,6 +43,7 @@ jobs:
           if [ -f tests/test_sandbox_strict.py ]; then python tests/test_sandbox_strict.py; fi
           if [ -f tests/test_slicer_check.py ]; then python tests/test_slicer_check.py; fi
           if [ -f tests/test_refine_patch.py ]; then python tests/test_refine_patch.py; fi
+          if [ -f tests/test_loft_topology.py ]; then python tests/test_loft_topology.py; fi
 
   smoke-benchmark:
     name: smoke benchmark

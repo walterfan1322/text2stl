@@ -134,23 +134,37 @@ Same pattern works for teapots, pitchers, coffee cups — change handle
 height/curvature and body dimensions. To make the handle more D-shaped,
 replace `threePointArc` with a polyline via `moveTo(...).lineTo(...)...`.
 
-5. Shoe (loft between two outlines):
+5. Shoe (loft between EXACTLY TWO outlines with IDENTICAL point counts):
 
-CRITICAL: a shoe is NOT a cylinder. The two outlines MUST be actual
-foot-shaped polygons — asymmetric, elongated along X (toe→heel), with
-a wider ball of the foot. If you loft two identical circles or squares
-you get a can, not a shoe. The sole is LONG and LOW (280mm long × 100mm
-wide × flat), the upper is a smaller rounded oval ≥ 60mm up in Z.
+CRITICAL — there are THREE rules and breaking ANY of them produces a flat blob:
+
+(a) EXACTLY TWO cross-sections in the loft chain. NOT 3, NOT 5. Two.
+    More sections only help if every single one has the SAME point count,
+    which the LLM almost never does. The simple 2-outline loft below is
+    a fully-formed shoe; do not "improve" it by adding intermediate
+    cross-sections at toe / ball / instep / heel / collar — those will
+    have different point counts, the loft will degenerate, and the
+    rendered STL will be a flat outsole-only slab.
+
+(b) Both polylines MUST have the SAME number of points. If sole_pts has
+    15 points, upper_pts must also have 15 points. Mismatched counts make
+    CadQuery's loft kernel produce a sliver that the judge sees as a "blob".
+
+(c) The two outlines MUST be FOOT-SHAPED — asymmetric, elongated along X
+    (toe→heel ~280mm), wider at the ball. NOT a circle, NOT a square.
+    The upper is a smaller, ROUNDER inset version, sitting 60–80mm up in Z.
+
+The minimal working shoe — copy this verbatim, just adjust dimensions:
 
 ```python
 import cadquery as cq
-# Sole outline at Z=0: asymmetric foot footprint in (X, Y) mm.
-# X = toe(0) → heel(280);  Y = inside(0) → outside(100).
+# Sole outline at Z=0: asymmetric foot footprint, 15 points.
 sole_pts = [(0,30),(15,10),(50,0),(120,0),(200,0),(250,10),(275,30),
             (280,55),(270,80),(240,95),(180,100),(100,100),(40,95),(10,80),(0,55)]
-# Upper outline at Z=70: smaller oval, inset from sole.
-upper_pts = [(30,40),(60,25),(110,20),(170,20),(220,25),(250,40),
-             (250,65),(220,80),(170,85),(110,85),(60,80),(30,65)]
+# Upper outline at Z=70: smaller rounded oval, ALSO 15 points.
+upper_pts = [(20,40),(40,25),(80,20),(140,20),(200,20),(240,25),(255,40),
+             (255,65),(240,80),(200,90),(140,90),(80,90),(40,85),(20,70),(20,55)]
+assert len(sole_pts) == len(upper_pts), "loft polylines must match point count"
 result = (cq.Workplane("XY")
           .polyline(sole_pts).close()
           .workplane(offset=70)
@@ -159,9 +173,20 @@ result = (cq.Workplane("XY")
 export_stl(result, OUTPUT_PATH)
 ```
 
-Same pattern works for any organic tapered form (bottle with shoulder,
-boat hull, car body). Key: use ASYMMETRIC point lists so the two
-outlines differ in shape (not just size).
+ANTI-PATTERN — DO NOT WRITE THIS:
+```python
+# WRONG: 5 cross-sections with different point counts
+toe_pts = [...19 points...]
+ball_pts = [...19 points...]
+instep_pts = [...18 points...]   # ← mismatch!
+heel_pts = [...15 points...]      # ← mismatch!
+collar_pts = [...14 points...]    # ← mismatch!
+# This loft FAILS silently, you get only the flat outsole.
+```
+
+Same 2-outline loft pattern works for any tapered organic form (bottle
+with shoulder, boat hull). Use ASYMMETRIC point lists so the two outlines
+differ in SHAPE (not just size), keep the count IDENTICAL.
 
 6. Chair (composite: seat + 4 legs + backrest via union):
 

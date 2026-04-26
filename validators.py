@@ -491,7 +491,108 @@ def validate_trimesh(code: str) -> ValidationResult:
 
 
 def validate_cadquery(code: str) -> ValidationResult:
-    return validate_code(code, allowed_calls=ALLOWED_CALLS_CADQUERY)
+    res = validate_code(code, allowed_calls=ALLOWED_CALLS_CADQUERY)
+    # Topology pre-check on top of the API allowlist: catches the most common
+    # silent-failure mode for shoes/bottles/organic shapes — the LLM emits
+    # multiple `.polyline(...)` calls feeding into a single `.loft()` chain
+    # but with mismatched point counts. CadQuery's loft requires identical
+    # vertex counts across all sections; mismatched counts produce degenerate
+    # geometry (or fail at exec with an opaque BRep error). Catching it here
+    # gives the LLM a clear, actionable retry message.
+    try:
+        loft_errs = check_loft_topology(code)
+    except Exception:
+        loft_errs = []
+    if loft_errs:
+        merged = list(res.errors) + loft_errs
+        return ValidationResult(ok=False, errors=merged)
+    return res
+
+
+def check_loft_topology(code: str) -> list[str]:
+    """Return a list of human-readable errors for any `.loft()` call whose
+    polyline cross-sections have mismatched point counts.
+
+    Resolves polyline arguments that reference module-level list literals
+    (e.g. `sole_pts = [(0,30),(15,10),...]; ...polyline(sole_pts)...`).
+
+    Returns [] if all loft chains are well-formed (or if no loft is present)."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    # Step 1: build name -> length map for module-level list literals.
+    # Only count entries that look like (x, y) tuples; ignore everything else
+    # so we don't flag false positives on unrelated lists.
+    name_to_len: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.List):
+            elts = node.value.elts
+            if not elts:
+                continue
+            if not all(isinstance(e, ast.Tuple) and len(e.elts) in (2, 3) for e in elts):
+                continue
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    name_to_len[tgt.id] = len(elts)
+
+    def polyline_len(arg: ast.AST) -> int | None:
+        """Return point count for a polyline argument, or None if unknown."""
+        if isinstance(arg, ast.List):
+            if all(isinstance(e, ast.Tuple) and len(e.elts) in (2, 3) for e in arg.elts):
+                return len(arg.elts)
+            return None
+        if isinstance(arg, ast.Name):
+            return name_to_len.get(arg.id)
+        return None
+
+    # Step 2: for every `.loft(...)` call, walk back through the call chain
+    # collecting `.polyline(arg)` cross-sections.
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "loft"):
+            continue
+        # Walk receiver chain
+        sections: list[tuple[str, int | None]] = []  # (label, n_points)
+        cursor: ast.AST | None = node.func.value
+        while isinstance(cursor, ast.Call) and isinstance(cursor.func, ast.Attribute):
+            attr = cursor.func.attr
+            if attr == "polyline" and cursor.args:
+                arg = cursor.args[0]
+                label = arg.id if isinstance(arg, ast.Name) else f"<inline-{getattr(arg, 'lineno', '?')}>"
+                sections.append((label, polyline_len(arg)))
+            cursor = cursor.func.value
+        if len(sections) < 2:
+            continue  # not a loft chain we recognize
+        # Reverse so they're in source order (we walked outward)
+        sections.reverse()
+        known = [(lab, n) for lab, n in sections if n is not None]
+        if len(known) < 2:
+            continue  # can't decide; let exec catch it
+        counts = sorted({n for _, n in known})
+        if len(counts) > 1:
+            detail = ", ".join(f"{lab}={n}" for lab, n in known)
+            errors.append(
+                f"loft topology mismatch — sections must have IDENTICAL point counts, "
+                f"got {detail}. CadQuery's .loft() requires every cross-section "
+                f"polyline to have the same number of vertices. "
+                f"FIX: replace the entire result with EXACTLY this 2-section shoe "
+                f"(both polylines have 15 points), then adjust dimensions if needed:\n"
+                f"```python\n"
+                f"import cadquery as cq\n"
+                f"sole_pts  = [(0,30),(15,10),(50,0),(120,0),(200,0),(250,10),(275,30),"
+                f"(280,55),(270,80),(240,95),(180,100),(100,100),(40,95),(10,80),(0,55)]\n"
+                f"upper_pts = [(20,40),(40,25),(80,20),(140,20),(200,20),(240,25),(255,40),"
+                f"(255,65),(240,80),(200,90),(140,90),(80,90),(40,85),(20,70),(20,55)]\n"
+                f"result = (cq.Workplane(\"XY\").polyline(sole_pts).close()"
+                f".workplane(offset=70).polyline(upper_pts).close().loft(combine=True))\n"
+                f"export_stl(result, OUTPUT_PATH)\n"
+                f"```"
+            )
+    return errors
 
 
 def format_errors_for_llm(errors: list[str], max_errors: int = 8) -> str:
