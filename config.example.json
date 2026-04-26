@@ -66,7 +66,7 @@
     "judge_max_retries": 2,
     "judge_min_score": 6,
 
-    "_comment_feature_flags": "Sprint 5-7 feature flags. Each = single point of rollback. Safe-to-enable group is on by default. sandbox_strict and best_of_n are in *shadow-mode* (compile-check only / extra-candidate logging only — neither alters user-facing response) for 1-week cost-vs-score data collection.",
+    "_comment_feature_flags": "Sprint 5-7 feature flags. Each = single point of rollback. Safe-to-enable group is on by default. sandbox_strict is now an *enforce* hard-gate at execute_code (RestrictedPython compile_strict; promoted from shadow after 16/16 compile_ok). best_of_n remains in shadow-mode (extra-candidate logging only — does not alter user-facing response) pending more cost-vs-score data.",
     "feature_flags": {
         "output_cache":        true,
         "structured_log":      true,

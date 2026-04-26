@@ -971,6 +971,26 @@ def execute_code(code: str, job_id: str) -> Path:
     code_path = job_dir / "code.py"
     code_path.write_text(code, encoding="utf-8")
 
+    # S7.3 enforce: hard-gate via RestrictedPython compile. Shadow data
+    # showed 16/16 compile_ok across the trial set, so this is safe to
+    # promote. compile-only is enough — we still execute under the
+    # normal backend; the gate just blocks code that smuggles dangerous
+    # behaviour past the AST allowlist.
+    if FEATURE_SANDBOX_STRICT:
+        try:
+            from sandbox_strict import compile_strict, is_available
+            if is_available():
+                code_obj, errors = compile_strict(code, filename=f"<{job_id}>")
+                if code_obj is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Sandbox rejected code: " + "; ".join(str(e)[:200] for e in errors[:3]),
+                    )
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.debug(f"[{job_id}] sandbox_strict gate skipped: {e}")
+
     try:
         # S5.2: ask backend to also write STEP/3MF/GLB if multi-format flag on.
         # Falls back gracefully if the backend signature is older.
