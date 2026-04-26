@@ -16,7 +16,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import httpx
@@ -1036,6 +1036,28 @@ def execute_code(code: str, job_id: str) -> Path:
 MAX_RETRIES = 2
 
 
+class JobEvents:
+    """Event emitter for /api/generate. No-op for the legacy endpoint;
+    pushes onto an asyncio.Queue for the SSE streaming endpoint, so
+    callers can flush stage progress + the STL URL ahead of the (slow)
+    judge round-trip.
+
+    The legacy /api/generate keeps its blocking response intact — this
+    class only fans out additional events to subscribed listeners; it
+    never short-circuits the existing return path.
+    """
+    def __init__(self, queue: "asyncio.Queue | None" = None):
+        self.queue = queue
+
+    async def emit(self, event_type: str, **data) -> None:
+        if self.queue is None:
+            return
+        try:
+            await self.queue.put({"type": event_type, **data})
+        except Exception:
+            pass
+
+
 def _validate_for_backend(code: str):
     """Run AST validation using the active backend's allowlist."""
     if not AST_VALIDATE:
@@ -1641,9 +1663,16 @@ def _run_slicer_check(stl_path: Path) -> dict | None:
         return None
 
 
-@app.post("/api/generate", response_model=GenerateResponse)
-async def generate(req: GenerateRequest, no_cache: bool = False):
-    """Generate 3D model from natural language description."""
+async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
+                         events: JobEvents | None = None):
+    """Shared body for /api/generate and /api/generate/stream.
+
+    `events` (when non-None) gets stage-progress, stl_ready, and
+    judge_done pushes so a streaming consumer can flash the STL viewer
+    ~30s before the judge round-trip finishes.
+    """
+    if events is None:
+        events = JobEvents()
     if not req.prompt.strip():
         raise HTTPException(status_code=400, detail="Prompt is required")
 
@@ -1654,6 +1683,7 @@ async def generate(req: GenerateRequest, no_cache: bool = False):
 
     job_id = str(uuid.uuid4())[:8]
     _start_ts = time.time()
+    await events.emit("progress", stage="start", job_id=job_id)
 
     # S5.1: output-cache lookup. Cache key includes the system_prompt
     # actually used (with pattern_cache injections), so cache stays
@@ -1678,6 +1708,8 @@ async def generate(req: GenerateRequest, no_cache: bool = False):
                     judge_score=hit.get("judge_score"),
                     latency_ms=int((time.time() - _start_ts) * 1000),
                 )
+            await events.emit("cache_hit", job_id=resp.id,
+                              stl_url=resp.stl_url, code=resp.code)
             return resp
 
     if FEATURE_STRUCTURED_LOG:
@@ -1692,12 +1724,32 @@ async def generate(req: GenerateRequest, no_cache: bool = False):
     if not _using_cloud:
         await tunnel.ensure_tunnel()
     try:
-        # Step 0: Web search for design references (translate first via LLM)
-        log.info(f"[{job_id}] Searching web for design references: {req.prompt[:60]}")
-        search_info = await search_object_references(req.prompt)
-        if search_info:
-            log.info(f"[{job_id}] Search results: {search_info[:200]}")
+        # Step 0: Web search for design references (translate first via LLM).
+        # Optimization: when pattern_cache already has high-scoring samples
+        # for this prompt's category, skip the 5-15s web search — the
+        # cached few-shot examples are a stronger signal than the noisy
+        # DDGS results, and they're injected into system_prompt anyway.
+        try:
+            _cached_examples = PATTERN_CACHE.examples_for(req.prompt)
+        except Exception:
+            _cached_examples = []
+        if _cached_examples:
+            log.info(f"[{job_id}] Skipping web search: "
+                     f"{len(_cached_examples)} pattern_cache example(s) available")
+            search_info = ""
+            await events.emit("progress", stage="web_search",
+                              status="skipped",
+                              detail=f"{len(_cached_examples)} cached examples")
+        else:
+            await events.emit("progress", stage="web_search", status="start")
+            log.info(f"[{job_id}] Searching web for design references: {req.prompt[:60]}")
+            search_info = await search_object_references(req.prompt)
+            if search_info:
+                log.info(f"[{job_id}] Search results: {search_info[:200]}")
+            await events.emit("progress", stage="web_search", status="done",
+                              detail=f"{len(search_info)} chars" if search_info else "no results")
         # Step 1: Enrich the prompt with detailed 3D design specification
+        await events.emit("progress", stage="enrich", status="start")
         log.info(f"[{job_id}] Enriching prompt: {req.prompt[:100]}")
         user_content = req.prompt
         if search_info:
@@ -1708,6 +1760,8 @@ async def generate(req: GenerateRequest, no_cache: bool = False):
         ]
         enriched = await call_ollama(enrich_messages, req.model)
         enriched = enriched.strip()
+        await events.emit("progress", stage="enrich", status="done",
+                          enriched_prompt=enriched[:300])
         log.info(f"[{job_id}] Enriched: {enriched[:200]}")
         # Save enriched prompt
         enrich_dir = OUTPUT_DIR / job_id
@@ -1728,11 +1782,14 @@ async def generate(req: GenerateRequest, no_cache: bool = False):
         total_attempts = 1 + MAX_RETRIES  # exec-fix attempts per generation
         judge_rounds = JUDGE_MAX_RETRIES if JUDGE_ENABLED else 0
 
+        stl_ready_emitted = False
         # Outer loop: visual-judge rounds (incl. round 0)
         for judge_round in range(judge_rounds + 1):
             # Inner loop: exec-fix attempts (regen on exec/validation error)
             inner_success = False
             for attempt in range(total_attempts):
+                await events.emit("progress", stage="codegen", status="start",
+                                  judge_round=judge_round + 1, attempt=attempt + 1)
                 raw_code = await call_ollama(messages, req.model)
                 raw_path = OUTPUT_DIR / job_id / f"raw_judge{judge_round}_attempt{attempt+1}.txt"
                 raw_path.parent.mkdir(exist_ok=True)
@@ -1754,11 +1811,17 @@ async def generate(req: GenerateRequest, no_cache: bool = False):
                     continue
 
                 try:
+                    await events.emit("progress", stage="exec", status="start",
+                                      judge_round=judge_round + 1, attempt=attempt + 1)
                     await asyncio.to_thread(execute_code, code, job_id)
                     inner_success = True
+                    await events.emit("progress", stage="exec", status="done",
+                                      judge_round=judge_round + 1)
                     break
                 except HTTPException as e:
                     last_error = e.detail
+                    await events.emit("progress", stage="exec", status="fail",
+                                      detail=str(last_error)[:200])
                     log.warning(f"[{job_id}] J{judge_round}A{attempt+1} exec fail: {last_error}")
                     log.warning(f"[{job_id}] Failed code (first 600 chars):\n{code[:600]}")
                     if attempt < total_attempts - 1:
@@ -1780,6 +1843,19 @@ async def generate(req: GenerateRequest, no_cache: bool = False):
 
             # We have an executable STL.
             stl_path = OUTPUT_DIR / job_id / "model.stl"
+
+            # Early-flush: tell the streaming consumer the STL exists so
+            # the 3D viewer can preview it ~30s before judge finishes.
+            # Subsequent judge-retries overwrite the same job_id/model.stl
+            # path; frontend re-loads on the final `done` event.
+            if not stl_ready_emitted:
+                await events.emit("stl_ready",
+                                  job_id=job_id,
+                                  stl_url=f"/api/download/{job_id}",
+                                  code=code,
+                                  enriched_prompt=enriched,
+                                  search_info=search_info)
+                stl_ready_emitted = True
 
             # S4.2: pre-judge watertight gate. If the STL isn't
             # watertight, skip the (expensive) VLM judge and feed a
@@ -1859,7 +1935,11 @@ async def generate(req: GenerateRequest, no_cache: bool = False):
                 )})
                 continue  # skip VLM, next judge round
 
+            await events.emit("progress", stage="judge", status="start",
+                              judge_round=judge_round + 1)
             thumbs, judge = await _render_and_judge(job_id, stl_path, req.prompt)
+            await events.emit("progress", stage="judge", status="done",
+                              score=(judge.match_score if judge else None))
 
             response = GenerateResponse(
                 id=job_id,
@@ -1960,6 +2040,58 @@ async def generate(req: GenerateRequest, no_cache: bool = False):
     finally:
         if not _using_cloud:
             tunnel.release()
+
+
+@app.post("/api/generate", response_model=GenerateResponse)
+async def generate(req: GenerateRequest, no_cache: bool = False):
+    """Generate 3D model from natural language description (legacy
+    blocking endpoint — callers receive the full response only after
+    judge completes). Use /api/generate/stream for SSE progress + STL
+    early-flush."""
+    return await _generate_impl(req, no_cache=no_cache, events=JobEvents())
+
+
+@app.post("/api/generate/stream")
+async def generate_stream(req: GenerateRequest, no_cache: bool = False):
+    """Streaming variant of /api/generate. Returns text/event-stream.
+
+    Events:
+    - progress {stage,status,...}    — per-phase pings
+    - cache_hit {job_id,stl_url,..}  — output_cache short-circuit
+    - stl_ready {job_id,stl_url,..}  — STL exists, viewer can preview
+    - done {response: {...}}         — final GenerateResponse
+    - error {message,status}         — pipeline failed
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    events = JobEvents(queue=queue)
+
+    async def runner():
+        try:
+            response = await _generate_impl(req, no_cache=no_cache, events=events)
+            await events.emit("done", response=response.dict() if response else None)
+        except HTTPException as e:
+            await events.emit("error",
+                              message=str(e.detail), status=e.status_code)
+        except Exception as e:
+            log.exception("generate_stream runner failed")
+            await events.emit("error", message=str(e), status=500)
+        finally:
+            await queue.put(None)  # sentinel
+
+    asyncio.create_task(runner())
+
+    async def stream():
+        # nudge the client to open the channel right away
+        yield ": ping\n\n"
+        while True:
+            evt = await queue.get()
+            if evt is None:
+                break
+            yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 class RefineRequest(BaseModel):

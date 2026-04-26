@@ -403,6 +403,76 @@ function parseSTL(buffer) {
 }
 
 // === API ===
+const STAGE_LABELS = {
+    web_search: { icon: '🔍', name: '搜尋參考' },
+    enrich:     { icon: '📝', name: '補齊描述' },
+    codegen:    { icon: '💻', name: '生成程式碼' },
+    exec:       { icon: '⚙️',  name: '執行建模' },
+    judge:      { icon: '🤖', name: '視覺評審' },
+};
+const STAGE_ORDER = ['web_search', 'enrich', 'codegen', 'exec', 'judge'];
+
+function renderStages(state) {
+    // state: {stage_key: 'pending'|'active'|'done'|'skipped'|'fail', detail?: string}
+    let html = '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:center;margin-top:10px;">';
+    STAGE_ORDER.forEach(k => {
+        const s = state[k] || 'pending';
+        const meta = STAGE_LABELS[k];
+        let bg = '#2a2a40', fg = '#666';
+        if (s === 'active') { bg = '#7b2ff7'; fg = '#fff'; }
+        else if (s === 'done') { bg = '#1a3a1a'; fg = '#4ade80'; }
+        else if (s === 'skipped') { bg = '#1a1a2a'; fg = '#888'; }
+        else if (s === 'fail') { bg = '#3a1a1a'; fg = '#ef4444'; }
+        const mark = s === 'done' ? '✓' : (s === 'skipped' ? '⏭' : (s === 'fail' ? '✗' : (s === 'active' ? '⏳' : '·')));
+        html += `<span style="font-size:11px;padding:3px 8px;border-radius:10px;background:${bg};color:${fg};">${mark} ${meta.icon} ${meta.name}</span>`;
+    });
+    html += '</div>';
+    return html;
+}
+
+function renderJudgeBox(j, attempts) {
+    if (!j) return '';
+    const score = (j.match_score === null || j.match_score === undefined) ? '—' : `${j.match_score}/10`;
+    const scoreColor = (j.match_score === null || j.match_score === undefined) ? '#888'
+        : (j.match_score >= 8 ? '#4ade80' : (j.match_score >= 6 ? '#f59e0b' : '#ef4444'));
+    const attemptBadge = attempts && attempts > 1
+        ? ` <span style="color:#888;">(${attempts} rounds)</span>` : '';
+    let html = `<div style="font-size:12px;margin-top:6px;padding-top:6px;border-top:1px solid #333;">`;
+    html += `<div><span style="color:#aaa;">🤖 視覺評審：</span><span style="color:${scoreColor};font-weight:bold;">${score}</span>`;
+    if (j.category) html += ` <span style="color:#888;">"${j.category}"</span>`;
+    html += attemptBadge + `</div>`;
+    if (j.geometry_issues && j.geometry_issues.length > 0) {
+        html += `<details style="margin-top:4px;color:#aaa;"><summary style="cursor:pointer;">⚠️ 幾何問題 (${j.geometry_issues.length})</summary><ul style="margin:4px 0 0 14px;padding:0;">`;
+        j.geometry_issues.forEach(x => { html += `<li style="margin-bottom:2px;">${x}</li>`; });
+        html += `</ul></details>`;
+    }
+    if (j.fix_suggestion) {
+        html += `<div style="color:#888;margin-top:4px;">💡 建議：${j.fix_suggestion}</div>`;
+    }
+    html += `</div>`;
+    return html;
+}
+
+function renderInfoBox(stl_ready_data, search_info, enriched_prompt, judge, thumbnails, attempts) {
+    let html = '<div style="color:#4ade80;font-weight:bold;margin-bottom:4px;">✅ 模型已生成</div>';
+    if (search_info) {
+        html += `<details style="font-size:11px;color:#888;margin-bottom:4px;"><summary style="cursor:pointer;color:#aaa;">🔍 搜尋到的參考資料</summary><div style="margin-top:4px;white-space:pre-wrap;">${search_info}</div></details>`;
+    }
+    if (enriched_prompt) {
+        html += `<details style="font-size:11px;color:#888;"><summary style="cursor:pointer;color:#aaa;">📝 AI 補齊的描述</summary><div style="margin-top:4px;">${enriched_prompt}</div></details>`;
+    }
+    html += renderJudgeBox(judge, attempts);
+    if (thumbnails && thumbnails.length > 0) {
+        let thumbHtml = '<div style="margin-top:6px;display:flex;gap:3px;flex-wrap:wrap;">';
+        thumbnails.forEach(url => {
+            thumbHtml += `<img src="${url}" style="width:60px;height:60px;object-fit:cover;border:1px solid #333;border-radius:3px;" />`;
+        });
+        thumbHtml += '</div>';
+        html += thumbHtml;
+    }
+    return html;
+}
+
 async function generate() {
     const prompt = document.getElementById('prompt').value.trim();
     if (!prompt) return;
@@ -410,88 +480,113 @@ async function generate() {
     const btn = document.getElementById('btn-generate');
     const statusEl = document.getElementById('status');
     const codeEl = document.getElementById('code-output');
+    const genInfoBox = document.getElementById('gen-info-box');
 
     btn.disabled = true;
     btn.textContent = '生成中...';
-    statusEl.className = 'status';
-    statusEl.innerHTML = '<div class="spinner"></div><p>正在生成 3D 模型，請稍候...</p><p style="font-size:12px;color:#555;margin-top:8px;">① 搜尋參考資料 → ② 補齊描述 → ③ 生成程式碼 → STL</p>';
     codeEl.textContent = '# 正在生成...';
+
+    const stageState = {};
+    const renderStatus = (msg) => {
+        statusEl.className = 'status';
+        statusEl.innerHTML = `<div class="spinner"></div><p>${msg}</p>` + renderStages(stageState);
+    };
+    renderStatus('正在生成 3D 模型...');
+
+    let stlLoaded = false;
+    let lastSearchInfo = '';
+    let lastEnriched = '';
+    let lastCode = '';
+    let lastJobId = null;
 
     try {
         const model = document.getElementById('model-select').value;
-        const resp = await fetch('/api/generate', {
+        const resp = await fetch('/api/generate/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ prompt, model }),
         });
-
-        if (!resp.ok) {
-            const err = await resp.json();
-            throw new Error(err.detail || 'Generation failed');
+        if (!resp.ok || !resp.body) {
+            const errTxt = await resp.text().catch(() => 'stream failed');
+            throw new Error(errTxt.slice(0, 200));
         }
 
-        const data = await resp.json();
-        currentJobId = data.id;
-        codeEl.textContent = data.code;
-        currentCode = data.code;
-        enrichedPrompt = data.enriched_prompt || '';
-        // S5.2: show format-specific download buttons if extras were exported.
-        updateFormatButtons(data.formats);
-        // S6.2: render print-readiness warning chips.
-        renderPrintWarnings(data.print_warnings);
-        iterationCount = 0;
-        document.getElementById('iteration-count').textContent = '0';
-        document.getElementById('iteration-badge').style.display = 'none';
-        document.getElementById('review-box').style.display = 'none';
-        // Hide the 3D viewer overlay — don't block the model
-        statusEl.className = 'status hidden';
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
 
-        // Show search + enriched info in the SIDEBAR gen-info-box
-        const genInfoBox = document.getElementById('gen-info-box');
-        let infoHtml = '<div style="color:#4ade80;font-weight:bold;margin-bottom:4px;">✅ 生成成功</div>';
-        if (data.search_info) {
-            infoHtml += `<details style="font-size:11px;color:#888;margin-bottom:4px;"><summary style="cursor:pointer;color:#aaa;">🔍 搜尋到的參考資料</summary><div style="margin-top:4px;white-space:pre-wrap;">${data.search_info}</div></details>`;
-        }
-        if (data.enriched_prompt) {
-            infoHtml += `<details style="font-size:11px;color:#888;"><summary style="cursor:pointer;color:#aaa;">📝 AI 補齊的描述</summary><div style="margin-top:4px;">${data.enriched_prompt}</div></details>`;
-        }
-        // S3.2: judge feedback pane
-        if (data.judge) {
-            const j = data.judge;
-            const score = (j.match_score === null || j.match_score === undefined) ? '—' : `${j.match_score}/10`;
-            const scoreColor = (j.match_score === null || j.match_score === undefined) ? '#888'
-                : (j.match_score >= 8 ? '#4ade80' : (j.match_score >= 6 ? '#f59e0b' : '#ef4444'));
-            const attemptBadge = data.attempts && data.attempts > 1
-                ? ` <span style="color:#888;">(${data.attempts} rounds)</span>` : '';
-            let judgeHtml = `<div style="font-size:12px;margin-top:6px;padding-top:6px;border-top:1px solid #333;">`;
-            judgeHtml += `<div><span style="color:#aaa;">🤖 視覺評審：</span><span style="color:${scoreColor};font-weight:bold;">${score}</span>`;
-            if (j.category) judgeHtml += ` <span style="color:#888;">"${j.category}"</span>`;
-            judgeHtml += attemptBadge + `</div>`;
-            if (j.geometry_issues && j.geometry_issues.length > 0) {
-                judgeHtml += `<details style="margin-top:4px;color:#aaa;"><summary style="cursor:pointer;">⚠️ 幾何問題 (${j.geometry_issues.length})</summary><ul style="margin:4px 0 0 14px;padding:0;">`;
-                j.geometry_issues.forEach(x => { judgeHtml += `<li style="margin-bottom:2px;">${x}</li>`; });
-                judgeHtml += `</ul></details>`;
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            // Parse SSE: events separated by \n\n
+            let idx;
+            while ((idx = buf.indexOf('\n\n')) !== -1) {
+                const block = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                if (!block.startsWith('data:')) continue;
+                const json = block.slice(5).trim();
+                if (!json) continue;
+                let evt;
+                try { evt = JSON.parse(json); } catch (e) { continue; }
+
+                if (evt.type === 'progress') {
+                    if (evt.status === 'start') stageState[evt.stage] = 'active';
+                    else if (evt.status === 'done') stageState[evt.stage] = 'done';
+                    else if (evt.status === 'skipped') stageState[evt.stage] = 'skipped';
+                    else if (evt.status === 'fail') stageState[evt.stage] = 'fail';
+                    renderStatus(stlLoaded ? '✨ 模型已預覽，評審進行中...' : '正在生成...');
+                } else if (evt.type === 'cache_hit') {
+                    lastJobId = evt.job_id;
+                    lastCode = evt.code || '';
+                    codeEl.textContent = lastCode;
+                    if (evt.stl_url) {
+                        loadSTL(evt.stl_url + '?t=' + Date.now());
+                        stlLoaded = true;
+                        statusEl.className = 'status hidden';
+                    }
+                } else if (evt.type === 'stl_ready') {
+                    lastJobId = evt.job_id;
+                    lastCode = evt.code || lastCode;
+                    lastEnriched = evt.enriched_prompt || lastEnriched;
+                    lastSearchInfo = evt.search_info || lastSearchInfo;
+                    codeEl.textContent = lastCode;
+                    loadSTL(evt.stl_url + '?t=' + Date.now());
+                    stlLoaded = true;
+                    statusEl.className = 'status hidden';
+                    // tease the info box even before judge arrives
+                    genInfoBox.innerHTML = '<div style="color:#7b8fff;font-weight:bold;margin-bottom:4px;">✨ 模型已預覽，評審進行中...</div>';
+                    genInfoBox.style.display = 'block';
+                } else if (evt.type === 'done') {
+                    const data = evt.response || {};
+                    currentJobId = data.id || lastJobId;
+                    currentCode = data.code || lastCode;
+                    enrichedPrompt = data.enriched_prompt || lastEnriched;
+                    codeEl.textContent = currentCode;
+                    updateFormatButtons(data.formats);
+                    renderPrintWarnings(data.print_warnings);
+                    iterationCount = 0;
+                    document.getElementById('iteration-count').textContent = '0';
+                    document.getElementById('iteration-badge').style.display = 'none';
+                    document.getElementById('review-box').style.display = 'none';
+                    if (data.stl_url && !stlLoaded) {
+                        loadSTL(data.stl_url + '?t=' + Date.now());
+                        stlLoaded = true;
+                    }
+                    statusEl.className = 'status hidden';
+                    genInfoBox.innerHTML = renderInfoBox(null,
+                        data.search_info || lastSearchInfo,
+                        data.enriched_prompt || lastEnriched,
+                        data.judge, data.thumbnails, data.attempts);
+                    genInfoBox.style.display = 'block';
+                    document.getElementById('refine-section').style.display = 'flex';
+                } else if (evt.type === 'error') {
+                    throw new Error(evt.message || 'pipeline error');
+                }
             }
-            if (j.fix_suggestion) {
-                judgeHtml += `<div style="color:#888;margin-top:4px;">💡 建議：${j.fix_suggestion}</div>`;
-            }
-            judgeHtml += `</div>`;
-            infoHtml += judgeHtml;
         }
-        // S3.2: thumbnails from rendered views
-        if (data.thumbnails && data.thumbnails.length > 0) {
-            let thumbHtml = '<div style="margin-top:6px;display:flex;gap:3px;flex-wrap:wrap;">';
-            data.thumbnails.forEach(url => {
-                thumbHtml += `<img src="${url}" style="width:60px;height:60px;object-fit:cover;border:1px solid #333;border-radius:3px;" />`;
-            });
-            thumbHtml += '</div>';
-            infoHtml += thumbHtml;
-        }
-        genInfoBox.innerHTML = infoHtml;
-        genInfoBox.style.display = 'block';
-
-        loadSTL(data.stl_url);
-        document.getElementById('refine-section').style.display = 'flex';
+        if (!stlLoaded) throw new Error('stream ended without STL');
+        return;
     } catch (e) {
         statusEl.innerHTML = `<p class="error">生成失敗</p><p class="error" style="font-size:13px;margin-top:8px;">${e.message}</p>`;
         codeEl.textContent = '# 生成失敗: ' + e.message;
