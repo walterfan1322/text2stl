@@ -76,7 +76,8 @@
         "sandbox_strict":      true,
         "best_of_n":           true,
         "slicer_check":        false,
-        "render_pyvista":      false
+        "render_pyvista":      false,
+        "refine_diff_patch":   true
     },
     "_comment_slicer_path": "PrusaSlicer 2.9.4 portable installed on 195. slicer_check flag stays OFF until first-run GUI wizard is dismissed manually on the Windows console (otherwise headless --export-gcode hangs and every generate eats a 60s timeout).",
     "slicer_path": "C:\\Tools\\PrusaSlicer\\PrusaSlicer-2.9.4\\prusa-slicer-console.exe",

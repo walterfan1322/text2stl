@@ -153,6 +153,7 @@ FEATURE_SANDBOX_STRICT      = bool(_FF.get("sandbox_strict", False))
 FEATURE_BEST_OF_N           = bool(_FF.get("best_of_n", False))
 FEATURE_SLICER_CHECK        = bool(_FF.get("slicer_check", False))
 FEATURE_RENDER_PYVISTA      = bool(_FF.get("render_pyvista", False))
+FEATURE_REFINE_DIFF_PATCH   = bool(_FF.get("refine_diff_patch", True))
 SLICER_PATH: str            = _cfg.get("slicer_path", "")
 BEST_OF_PER_CATEGORY: dict  = _cfg.get("best_of_per_category", {})
 
@@ -578,6 +579,15 @@ If there are real structural or functional problems, respond with a brief list o
 """
 
 SELF_REFINE_ROUNDS = 2  # Number of auto-review rounds
+
+
+# Diff-patch refine helpers — extracted so unit tests can import without
+# pulling in fastapi / cadquery. See refine_patch.py for details.
+from refine_patch import (
+    REFINE_PATCH_PROMPT,
+    apply_patch_edits as _apply_patch_edits,
+    parse_patch_response as _parse_patch_response,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2112,6 +2122,43 @@ async def refine(req: RefineRequest):
     if not _using_cloud:
         await tunnel.ensure_tunnel()
     try:
+        # ── Diff-patch fast path ────────────────────────────────────────────
+        # Ask the LLM for a small JSON of string-replacement edits instead of
+        # the whole rewritten file. Saves ~80% of refine output tokens and
+        # ~5–10s on most models for narrow feedback ("make it taller", "add
+        # handle"). Falls back to full-code rewrite below if the patch fails
+        # parse / find-uniqueness / AST validation / exec.
+        if FEATURE_REFINE_DIFF_PATCH:
+            try:
+                patch_msgs = [
+                    {"role": "system", "content": REFINE_PATCH_PROMPT},
+                    {"role": "user", "content": f"Current code:\n{req.current_code}\n\nFeedback: {req.feedback}"},
+                ]
+                raw_patch = await call_ollama(patch_msgs, req.model)
+                (OUTPUT_DIR / job_id).mkdir(exist_ok=True)
+                (OUTPUT_DIR / job_id / "raw_refine_patch.txt").write_text(raw_patch, encoding="utf-8")
+                edits, perr = _parse_patch_response(raw_patch)
+                if edits is not None:
+                    patched_code, aerr = _apply_patch_edits(req.current_code, edits)
+                    if aerr is None:
+                        vres = _validate_for_backend(patched_code)
+                        if vres is None or vres.ok:
+                            try:
+                                await asyncio.to_thread(execute_code, patched_code, job_id)
+                                log.info(f"[{job_id}] Refine via diff-patch succeeded ({len(edits)} edits)")
+                                return GenerateResponse(id=job_id, code=patched_code, stl_url=f"/api/download/{job_id}", enriched_prompt=req.feedback)
+                            except HTTPException as e:
+                                log.warning(f"[{job_id}] Refine patch exec failed, falling back to full-code: {e.detail}")
+                        else:
+                            log.warning(f"[{job_id}] Refine patch AST invalid, falling back: {vres.errors[:2]}")
+                    else:
+                        log.info(f"[{job_id}] Refine patch not applicable ({aerr}), falling back to full-code")
+                else:
+                    log.info(f"[{job_id}] Refine patch parse failed ({perr}), falling back to full-code")
+            except Exception as e:
+                log.warning(f"[{job_id}] Refine patch path errored, falling back: {e}")
+
+        # ── Full-code rewrite fallback ──────────────────────────────────────
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": "Here is the current code that generates a 3D model:"},
