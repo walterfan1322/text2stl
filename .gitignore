@@ -1,25 +1,58 @@
 # Logs
 *.log
 server-err.log
+server.log
+server_err.log
 server_stdout.log
 service.log
+tunnel.log
+uvicorn.err
+uvicorn.out
+watchdog.log
 
 # Output / generated files
+outputs/
 output/
 *.stl
 !phone_stand.stl
 
+# Cache / runtime data
+*.db
+output_cache.db
+pattern_cache.json
+structured_log.jsonl
+token_usage.jsonl
+
 # Backups
 *.bak*
+app.py.bak*
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.pytest_cache/
 
 # Config with secrets
 config.json
+.env
+.env.local
+.env.*.local
 
-# OS
+# Test artifacts
+tests/benchmark_results.json
+*.coverage
+
+# OS / editor
 Thumbs.db
 .DS_Store
+._*
+.vscode/
+.idea/
+*.swp
+
+# Git/build
+*.egg-info/
+dist/
+build/

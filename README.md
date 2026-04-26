@@ -2,91 +2,120 @@
 
 Natural language to 3D printable STL model generator.
 
-Input a description like "a chair" or "a gear with 20 teeth", and get a downloadable STL file ready for 3D printing.
+Input a description like "a chair" or "a mug with handle", and get a downloadable STL ready for 3D printing.
 
-## Architecture
+## Pipeline
 
 ```
-Browser  -->  FastAPI (port 8000)  -->  LLM (Ollama or Cloud API)
-                  |                           |
-                  v                           v
-             trimesh (Python)          Generate Python code
-                  |                    that builds 3D mesh
-                  v
-              STL file
+Prompt -> Web search -> LLM enrich -> LLM code gen -> Sandbox exec
+                                                        |
+                                                        v
+                                                   trimesh / cadquery
+                                                        |
+                                                        v
+                          Geom check + Watertight repair + Judge (VLM)
+                                                        |
+                                                        v
+                                                       STL
 ```
 
-**Pipeline:** User prompt --> Web search for references --> LLM enriches design spec --> LLM generates trimesh Python code --> Execute code --> Export STL
+## Features (Sprint 5-7)
 
-## Features
+**Generation**
+- Multi-backend: trimesh + cadquery (cadquery default for solids)
+- Multiple cloud LLMs with shape-based routing (MiniMax-M2.7, deepseek-chat, gemini-2.5-flash)
+- Pattern cache for instant cache hits (zero token, zero latency on repeats)
+- Best-of-N candidate generation per shape category
 
-- Natural language input (supports Chinese and English)
-- Web search for design references (dimensions, structure)
-- LLM-powered design enrichment and code generation
-- 3D preview in browser (Three.js)
-- Auto-review and iterative refinement
-- Manual feedback loop for adjustments
-- Multiple LLM backends:
-  - **Local**: Ollama models via SSH tunnel to GPU server
-  - **Cloud**: MiniMax, OpenAI-compatible APIs
+**Quality**
+- AST validator + RestrictedPython sandbox (`sandbox_strict`)
+- Programmatic geometry checks (`judge_geometric` — zero-token validation)
+- Mesh repair pipeline (pymeshfix + watertight check)
+- VLM judge with auto-retry on score < 6
+- Print readiness analyzer (overhang/support hints)
+
+**Robustness**
+- Output cache (avoid re-running same prompt+model+seed)
+- Structured JSONL logging for token tracking
+- Auto-failover between cloud providers
+- Multi-format export (STL/OBJ/3MF/STEP)
+
+**Frontend**
+- Three.js STL viewer with auto-rotate
+- Cloud-only model dropdown
+- Iterative refine via natural-language feedback
 
 ## Quick Start
 
-### 1. Install dependencies
-
 ```bash
+git clone https://github.com/walterfan1322/text2stl
+cd text2stl
 pip install -r requirements.txt
-```
+pip install pymeshfix scipy networkx pyvista RestrictedPython pymeshlab
 
-### 2. Configure
-
-Copy `config.example.json` to `config.json` and fill in your settings:
-
-```bash
+# Configure
 cp config.example.json config.json
-```
+# Edit config.json: fill cloud_providers.*.key with your API keys
 
-**For cloud API (recommended):**
-```json
-{
-    "cloud_api_key": "your-api-key",
-    "cloud_api_base": "https://api.minimax.io/v1",
-    "cloud_models": ["MiniMax-M2.7"]
-}
-```
-
-**For local Ollama:**
-```json
-{
-    "ollama_url": "http://localhost:11434",
-    "ollama_model": "qwen3.5:35b-a3b",
-    "ssh_tunnel_host": "user@your-gpu-server"
-}
-```
-
-### 3. Run
-
-```bash
+# Run
 python -m uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-Open `http://localhost:8000` in your browser.
+Open http://localhost:8000 in your browser.
 
-## Supported 3D Modeling Strategies
+## Configuration
 
-| Strategy | Use Case | Example |
+`config.json` controls everything. Key sections:
+
+```jsonc
+{
+  "cloud_providers": {
+    "minimax":  {"base": "https://api.minimax.io/v1",                       "key": "..."},
+    "deepseek": {"base": "https://api.deepseek.com/v1",                     "key": "..."},
+    "gemini":   {"base": "https://generativelanguage.googleapis.com/...",   "key": "..."}
+  },
+  "shape_routing": {"bottle": "deepseek-chat"},   // route specific shapes to specific models
+  "feature_flags": {
+    "output_cache":    true,
+    "geom_check":      true,
+    "sandbox_strict":  true,
+    "best_of_n":       true,
+    "slicer_check":    false   // requires desktop session
+  }
+}
+```
+
+API keys can also be supplied via environment variables: `MINIMAX_API_KEY`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`.
+
+## Modeling Strategies
+
+| Strategy | Use Case | Backend |
 |----------|----------|---------|
-| Extrude polygon | Flat objects with uniform cross-section | Bookend, bracket, wrench |
-| Solid of revolution | Round/symmetric objects | Cup, vase, bowl |
-| Composite primitives | Multi-part assembled objects | Chair, table, phone stand |
+| Extrude polygon | Flat objects with uniform cross-section | trimesh / cadquery |
+| Solid of revolution | Round/symmetric objects (cup, vase, bottle) | trimesh / cadquery |
+| Composite primitives | Multi-part assembled objects (chair, table) | trimesh / cadquery |
+
+## Tests
+
+```bash
+python tests/test_pattern_cache.py
+python tests/test_mesh_repair.py
+python tests/test_judge_geometric.py
+python tests/test_sandbox_strict.py
+python tests/test_best_of_n.py
+# ... see tests/ for full list
+```
+
+CI workflow at `.github/workflows/smoke.yml` runs unit tests on every PR plus a smoke benchmark when generation logic changes.
 
 ## Tech Stack
 
 - **Backend**: FastAPI + Uvicorn
-- **3D Engine**: trimesh (Python)
-- **LLM**: Ollama (local) / MiniMax (cloud) / OpenAI-compatible APIs
+- **3D Engine**: trimesh + cadquery + pymeshfix
+- **LLM**: MiniMax / DeepSeek / Gemini (OpenAI-compatible)
 - **Frontend**: Vanilla JS + Three.js (STL viewer)
-- **Tunnel**: Paramiko SSH (for remote GPU server)
+
+See [PLAN_v2.md](PLAN_v2.md) and [SPRINT_5_7_RESULTS.md](SPRINT_5_7_RESULTS.md) for design rationale and benchmarks.
 
 ## License
 

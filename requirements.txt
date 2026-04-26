@@ -4,3 +4,12 @@ httpx==0.27.0
 trimesh
 numpy-stl
 numpy
+shapely
+manifold3d
+ddgs
+pillow
+pyglet<2
+cadquery>=2.4
+# Optional: more aggressive mesh repair (S4.1). Safe to omit — mesh_repair
+# falls back to trimesh.repair only, and skips pymeshfix if not importable.
+pymeshfix

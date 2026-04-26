@@ -1,0 +1,247 @@
+{
+  "meta": {
+    "models": [
+      "MiniMax-M2.7",
+      "deepseek-chat"
+    ],
+    "shapes": [
+      "vase",
+      "pen_holder",
+      "bowl",
+      "phone_stand",
+      "mug",
+      "bottle",
+      "teapot",
+      "shoe",
+      "chair",
+      "table",
+      "keychain",
+      "figurine"
+    ],
+    "trials": 3,
+    "timestamp": 1777068271,
+    "source": "trials=3 benchmark"
+  },
+  "baseline": {
+    "MiniMax-M2.7": {
+      "vase": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.0,
+        "avg_score": 7.33,
+        "sd_score": 0.58,
+        "avg_attempts": 1,
+        "avg_time_s": 67.07
+      },
+      "pen_holder": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 9,
+        "sd_score": 1.0,
+        "avg_attempts": 1.33,
+        "avg_time_s": 72.03
+      },
+      "bowl": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.67,
+        "avg_score": 8,
+        "sd_score": 1.0,
+        "avg_attempts": 1.33,
+        "avg_time_s": 76.5
+      },
+      "phone_stand": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.67,
+        "avg_score": 7,
+        "sd_score": 0.0,
+        "avg_attempts": 1.33,
+        "avg_time_s": 67.87
+      },
+      "mug": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 7.67,
+        "sd_score": 1.15,
+        "avg_attempts": 1,
+        "avg_time_s": 126.73
+      },
+      "bottle": {
+        "n": 3,
+        "exec_pass_rate": 0.67,
+        "watertight_rate": 0.0,
+        "avg_score": 8.5,
+        "sd_score": 0.71,
+        "avg_attempts": 1,
+        "avg_time_s": 52.07
+      },
+      "teapot": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.33,
+        "avg_score": 7,
+        "sd_score": 1.0,
+        "avg_attempts": 1,
+        "avg_time_s": 85.6
+      },
+      "shoe": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 7.33,
+        "sd_score": 0.58,
+        "avg_attempts": 1.33,
+        "avg_time_s": 61.5
+      },
+      "chair": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 8.67,
+        "sd_score": 0.58,
+        "avg_attempts": 1,
+        "avg_time_s": 47.27
+      },
+      "table": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 8.67,
+        "sd_score": 0.58,
+        "avg_attempts": 1.33,
+        "avg_time_s": 56.93
+      },
+      "keychain": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 7.67,
+        "sd_score": 0.58,
+        "avg_attempts": 1,
+        "avg_time_s": 52.07
+      },
+      "figurine": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.0,
+        "avg_score": 9.33,
+        "sd_score": 0.58,
+        "avg_attempts": 1,
+        "avg_time_s": 41.53
+      }
+    },
+    "deepseek-chat": {
+      "vase": {
+        "n": 3,
+        "exec_pass_rate": 0.67,
+        "watertight_rate": 0.0,
+        "avg_score": 8,
+        "sd_score": 1.41,
+        "avg_attempts": 1.5,
+        "avg_time_s": 43.5
+      },
+      "pen_holder": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 7,
+        "sd_score": 1.0,
+        "avg_attempts": 1.33,
+        "avg_time_s": 48.13
+      },
+      "bowl": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.33,
+        "avg_score": 7.33,
+        "sd_score": 1.15,
+        "avg_attempts": 1.33,
+        "avg_time_s": 45.97
+      },
+      "phone_stand": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 7.67,
+        "sd_score": 0.58,
+        "avg_attempts": 1.33,
+        "avg_time_s": 44.47
+      },
+      "mug": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 8,
+        "sd_score": 0.0,
+        "avg_attempts": 1,
+        "avg_time_s": 43.93
+      },
+      "bottle": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.33,
+        "avg_score": 7.33,
+        "sd_score": 1.15,
+        "avg_attempts": 1.33,
+        "avg_time_s": 52.37
+      },
+      "teapot": {
+        "n": 3,
+        "exec_pass_rate": 0.67,
+        "watertight_rate": 0.0,
+        "avg_score": 8,
+        "sd_score": 0.0,
+        "avg_attempts": 2,
+        "avg_time_s": 85.57
+      },
+      "shoe": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.67,
+        "avg_score": 7,
+        "sd_score": 1.0,
+        "avg_attempts": 2.67,
+        "avg_time_s": 97.93
+      },
+      "chair": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.67,
+        "avg_score": 8,
+        "sd_score": 1.0,
+        "avg_attempts": 1.33,
+        "avg_time_s": 49.27
+      },
+      "table": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 1.0,
+        "avg_score": 7.33,
+        "sd_score": 0.58,
+        "avg_attempts": 1,
+        "avg_time_s": 32.6
+      },
+      "keychain": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.67,
+        "avg_score": 7.67,
+        "sd_score": 1.15,
+        "avg_attempts": 1.67,
+        "avg_time_s": 68.2
+      },
+      "figurine": {
+        "n": 3,
+        "exec_pass_rate": 1.0,
+        "watertight_rate": 0.0,
+        "avg_score": 8,
+        "sd_score": 1.0,
+        "avg_attempts": 1,
+        "avg_time_s": 41.2
+      }
+    }
+  }
+}

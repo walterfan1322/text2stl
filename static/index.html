@@ -184,7 +184,7 @@
     <header>
         <h1>Text2STL</h1>
         <span>自然語言 3D 建模 — 輸入描述，生成 STL</span>
-        <span id="tunnel-badge" style="margin-left:auto;font-size:11px;padding:3px 10px;border-radius:12px;background:#333;color:#888;">DGX: 待機</span>
+        <span id="tunnel-badge" style="display:none;margin-left:auto;font-size:11px;padding:3px 10px;border-radius:12px;background:#333;color:#888;">DGX: 待機</span>
     </header>
     <div class="main">
         <div class="sidebar">
@@ -193,8 +193,12 @@
                 <select id="model-select"><option>載入中...</option></select>
             </div>
             <div style="display:flex;flex-direction:column;gap:6px;">
-                <label>描述你想要的 3D 物件</label>
+                <label style="display:flex;justify-content:space-between;align-items:center;">
+                    <span>描述你想要的 3D 物件</span>
+                    <button id="btn-mic" onclick="toggleVoice()" type="button" title="語音輸入（Chrome / Safari 支援）" style="background:none;border:1px solid #555;color:#aaa;border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer;">🎤 語音</button>
+                </label>
                 <textarea id="prompt" placeholder="例如：一個直徑 50mm、高 80mm 的杯子，帶有把手&#10;&#10;一個齒輪，20 齒，模數 2&#10;&#10;一個手機支架"></textarea>
+                <div id="mic-status" style="display:none;font-size:11px;color:#10b981;">🔴 聆聽中... 講完按「停止」</div>
             </div>
             <button class="generate" id="btn-generate" onclick="generate()">生成 3D 模型</button>
             <div id="refine-section" style="display:none;flex-direction:column;gap:6px;">
@@ -207,6 +211,7 @@
                 </div>
                 <div style="display:flex;gap:8px;">
                     <button class="generate" id="btn-auto-review" onclick="autoReview()" style="flex:1;background:linear-gradient(135deg,#10b981,#06b6d4);font-size:14px;padding:10px;">🔍 自動審查修正</button>
+                    <button class="generate" id="btn-swap-model" onclick="regenerateSwapModel()" style="flex:1;background:linear-gradient(135deg,#6366f1,#8b5cf6);font-size:14px;padding:10px;" title="用下一個 model 重跑同一個 prompt">🔁 換模型重試</button>
                 </div>
                 <label style="margin-top:4px;">手動修改意見</label>
                 <textarea id="refine-input" style="height:60px;" placeholder="例如：靠背再傾斜一點、底座加厚、加一個凹槽放手機..."></textarea>
@@ -217,9 +222,13 @@
                 <pre id="code-output"># 程式碼會在這裡顯示...</pre>
             </div>
             <div class="actions">
-                <button onclick="downloadSTL()">下載 STL</button>
+                <button onclick="downloadFile('stl')">下載 STL</button>
+                <button onclick="downloadFile('step')" id="dl-step" style="display:none;">下載 STEP</button>
+                <button onclick="downloadFile('3mf')" id="dl-3mf" style="display:none;">下載 3MF</button>
+                <button onclick="downloadFile('glb')" id="dl-glb" style="display:none;">下載 GLB</button>
                 <button onclick="copyCode()">複製程式碼</button>
             </div>
+            <div id="print-warnings" style="margin-top:8px;"></div>
         </div>
         <div class="viewer">
             <canvas id="three-canvas"></canvas>
@@ -426,6 +435,10 @@ async function generate() {
         codeEl.textContent = data.code;
         currentCode = data.code;
         enrichedPrompt = data.enriched_prompt || '';
+        // S5.2: show format-specific download buttons if extras were exported.
+        updateFormatButtons(data.formats);
+        // S6.2: render print-readiness warning chips.
+        renderPrintWarnings(data.print_warnings);
         iterationCount = 0;
         document.getElementById('iteration-count').textContent = '0';
         document.getElementById('iteration-badge').style.display = 'none';
@@ -441,6 +454,38 @@ async function generate() {
         }
         if (data.enriched_prompt) {
             infoHtml += `<details style="font-size:11px;color:#888;"><summary style="cursor:pointer;color:#aaa;">📝 AI 補齊的描述</summary><div style="margin-top:4px;">${data.enriched_prompt}</div></details>`;
+        }
+        // S3.2: judge feedback pane
+        if (data.judge) {
+            const j = data.judge;
+            const score = (j.match_score === null || j.match_score === undefined) ? '—' : `${j.match_score}/10`;
+            const scoreColor = (j.match_score === null || j.match_score === undefined) ? '#888'
+                : (j.match_score >= 8 ? '#4ade80' : (j.match_score >= 6 ? '#f59e0b' : '#ef4444'));
+            const attemptBadge = data.attempts && data.attempts > 1
+                ? ` <span style="color:#888;">(${data.attempts} rounds)</span>` : '';
+            let judgeHtml = `<div style="font-size:12px;margin-top:6px;padding-top:6px;border-top:1px solid #333;">`;
+            judgeHtml += `<div><span style="color:#aaa;">🤖 視覺評審：</span><span style="color:${scoreColor};font-weight:bold;">${score}</span>`;
+            if (j.category) judgeHtml += ` <span style="color:#888;">"${j.category}"</span>`;
+            judgeHtml += attemptBadge + `</div>`;
+            if (j.geometry_issues && j.geometry_issues.length > 0) {
+                judgeHtml += `<details style="margin-top:4px;color:#aaa;"><summary style="cursor:pointer;">⚠️ 幾何問題 (${j.geometry_issues.length})</summary><ul style="margin:4px 0 0 14px;padding:0;">`;
+                j.geometry_issues.forEach(x => { judgeHtml += `<li style="margin-bottom:2px;">${x}</li>`; });
+                judgeHtml += `</ul></details>`;
+            }
+            if (j.fix_suggestion) {
+                judgeHtml += `<div style="color:#888;margin-top:4px;">💡 建議：${j.fix_suggestion}</div>`;
+            }
+            judgeHtml += `</div>`;
+            infoHtml += judgeHtml;
+        }
+        // S3.2: thumbnails from rendered views
+        if (data.thumbnails && data.thumbnails.length > 0) {
+            let thumbHtml = '<div style="margin-top:6px;display:flex;gap:3px;flex-wrap:wrap;">';
+            data.thumbnails.forEach(url => {
+                thumbHtml += `<img src="${url}" style="width:60px;height:60px;object-fit:cover;border:1px solid #333;border-radius:3px;" />`;
+            });
+            thumbHtml += '</div>';
+            infoHtml += thumbHtml;
         }
         genInfoBox.innerHTML = infoHtml;
         genInfoBox.style.display = 'block';
@@ -573,17 +618,119 @@ async function refine() {
     }
 }
 
-function downloadSTL() {
+function downloadSTL() { downloadFile('stl'); }  // legacy alias
+
+function downloadFile(fmt) {
     if (!currentJobId) return alert('尚未生成模型');
+    fmt = (fmt || 'stl').toLowerCase();
     const a = document.createElement('a');
-    a.href = `/api/download/${currentJobId}`;
-    a.download = `model-${currentJobId}.stl`;
+    a.href = `/api/download/${currentJobId}?fmt=${fmt}`;
+    a.download = `model-${currentJobId}.${fmt}`;
     a.click();
+}
+
+function updateFormatButtons(formats) {
+    // formats = {fmt: download_url} from response.formats (S5.2)
+    ['step', '3mf', 'glb'].forEach(fmt => {
+        const btn = document.getElementById('dl-' + fmt);
+        if (btn) btn.style.display = (formats && formats[fmt]) ? '' : 'none';
+    });
+}
+
+function renderPrintWarnings(warnings) {
+    const root = document.getElementById('print-warnings');
+    if (!root) return;
+    if (!warnings || !warnings.length) { root.innerHTML = ''; return; }
+    const sevColor = (s) => s === 'warn' ? '#ff9c4d' : '#7aa6ff';
+    let html = '<div style="font-size:12px;color:#aaa;margin-bottom:4px;">🖨️ 列印就緒檢查 (' + warnings.length + ')</div>';
+    html += '<div style="display:flex;flex-wrap:wrap;gap:4px;">';
+    warnings.forEach(w => {
+        html += '<span title="' + (w.message || '').replace(/"/g, '&quot;') +
+                '" style="font-size:11px;padding:2px 8px;border-radius:10px;background:#252525;color:' +
+                sevColor(w.severity) + ';border:1px solid ' + sevColor(w.severity) + ';">' +
+                (w.code || '?') + '</span>';
+    });
+    html += '</div>';
+    root.innerHTML = html;
+}
+
+// S4.8: rotate to next model in dropdown and re-run generate with same prompt.
+// Useful when first model produced low judge score / non-watertight STL.
+async function regenerateSwapModel() {
+    const select = document.getElementById('model-select');
+    if (!select || select.options.length < 2) {
+        alert('只有一個可用模型，無法換');
+        return;
+    }
+    const next = (select.selectedIndex + 1) % select.options.length;
+    const oldModel = select.value;
+    select.selectedIndex = next;
+    const newModel = select.value;
+    console.log(`Regenerate: ${oldModel} → ${newModel}`);
+    // Re-run the primary generate flow with the same prompt
+    await generate();
 }
 
 function copyCode() {
     const code = document.getElementById('code-output').textContent;
     navigator.clipboard.writeText(code);
+}
+
+// S8.4: voice input via Web Speech API. No external service.
+let _recognition = null;
+let _listening = false;
+function toggleVoice() {
+    const btn = document.getElementById('btn-mic');
+    const status = document.getElementById('mic-status');
+    const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Rec) {
+        alert('此瀏覽器不支援 Web Speech API（建議使用 Chrome 或 Safari）');
+        return;
+    }
+    if (_listening) {
+        try { _recognition && _recognition.stop(); } catch (e) {}
+        _listening = false;
+        btn.textContent = '🎤 語音';
+        status.style.display = 'none';
+        return;
+    }
+    _recognition = new Rec();
+    // Auto-detect: prefer zh-TW, fall back to en-US if user toggles in console.
+    _recognition.lang = navigator.language && navigator.language.startsWith('en') ? 'en-US' : 'zh-TW';
+    _recognition.interimResults = true;
+    _recognition.continuous = false;
+    _recognition.maxAlternatives = 1;
+    let finalText = '';
+    _recognition.onresult = (e) => {
+        let interim = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+            const r = e.results[i];
+            if (r.isFinal) finalText += r[0].transcript;
+            else interim += r[0].transcript;
+        }
+        const ta = document.getElementById('prompt');
+        ta.value = (finalText + interim).trim();
+    };
+    _recognition.onerror = (e) => {
+        console.error('SpeechRecognition error:', e.error);
+        status.textContent = `❌ 語音輸入錯誤: ${e.error}`;
+        status.style.color = '#ef4444';
+    };
+    _recognition.onend = () => {
+        _listening = false;
+        btn.textContent = '🎤 語音';
+        if (status.textContent.startsWith('🔴')) status.style.display = 'none';
+    };
+    try {
+        _recognition.start();
+        _listening = true;
+        btn.textContent = '⏹️ 停止';
+        status.style.display = 'block';
+        status.style.color = '#10b981';
+        status.textContent = '🔴 聆聽中... 講完會自動停止';
+    } catch (e) {
+        alert('啟動麥克風失敗: ' + e.message);
+    }
 }
 
 async function loadModels() {
@@ -596,7 +743,7 @@ async function loadModels() {
             const opt = document.createElement('option');
             opt.value = m;
             opt.textContent = m;
-            if (m === 'qwen3.5:35b-a3b') opt.selected = true;
+            // First model in list (cloud) is selected by default since DGX models hidden
             select.appendChild(opt);
         });
     } catch (e) {
@@ -627,25 +774,13 @@ async function updateTunnelStatus() {
         badge.textContent = 'DGX: --';
     }
 }
-setInterval(updateTunnelStatus, 5000);
+// DGX local models hidden from UI (2026-04-26); skip tunnel polling + warmup.
+// setInterval(updateTunnelStatus, 5000);
 
-// Pre-warm model on page load (background, no UI block)
+// Pre-warm model on page load — disabled when only cloud models are exposed,
+// since cloud APIs don't need warmup and /api/warmup hits the DGX tunnel.
 async function warmupModel() {
-    const badge = document.getElementById('tunnel-badge');
-    badge.textContent = 'DGX: 載入模型中...';
-    badge.style.background = '#3a3a1a';
-    badge.style.color = '#facc15';
-    try {
-        const model = document.getElementById('model-select').value;
-        await fetch('/api/warmup', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: model || null }),
-        });
-    } catch (e) {
-        console.error('Warmup failed:', e);
-    }
-    updateTunnelStatus();
+    // no-op: cloud models don't need a warmup call
 }
 
 // Init

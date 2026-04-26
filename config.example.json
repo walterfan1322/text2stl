@@ -4,10 +4,86 @@
     "ssh_tunnel_host": "user@YOUR_DGX_HOST",
     "ssh_key_path": "",
     "tunnel_idle_timeout": 900,
-    "cloud_api_key": "YOUR_CLOUD_API_KEY_HERE",
-    "cloud_api_base": "https://api.minimax.io/v1",
+
+    "cloud_providers": {
+        "minimax": {
+            "base": "https://api.minimax.io/v1",
+            "key": "YOUR_CLOUD_API_KEY_HERE"
+        },
+        "deepseek": {
+            "base": "https://api.deepseek.com/v1",
+            "key": "YOUR_API_KEY_HERE"
+        },
+        "gemini": {
+            "base": "https://generativelanguage.googleapis.com/v1beta/openai",
+            "key": "YOUR_GOOGLE_API_KEY_HERE"
+        }
+    },
     "cloud_models": [
         "MiniMax-M2.7",
-        "MiniMax-M2.5"
-    ]
+        "MiniMax-M2.5",
+        "deepseek-chat",
+        "deepseek-reasoner",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash"
+    ],
+    "model_provider": {
+        "MiniMax-M2.7": "minimax",
+        "MiniMax-M2.5": "minimax",
+        "deepseek-chat": "deepseek",
+        "deepseek-reasoner": "deepseek",
+        "gemini-2.5-flash": "gemini",
+        "gemini-2.5-flash-lite": "gemini",
+        "gemini-2.0-flash": "gemini"
+    },
+    "model_failover": {
+        "MiniMax-M2.7": ["deepseek-chat"],
+        "MiniMax-M2.5": ["deepseek-chat"],
+        "deepseek-chat": ["MiniMax-M2.7"],
+        "gemini-2.5-flash": ["MiniMax-M2.7", "deepseek-chat"]
+    },
+
+    "_comment_shape_routing": "P3: route by inferred shape category (pattern_cache.infer_category). Based on trials=3 benchmark — MiniMax wins 5/12 shapes outright, ties 7, loses 0. Only bottle routes to DeepSeek (DeepSeek 100% pass-rate vs MiniMax 67%).",
+    "shape_routing_enabled": true,
+    "shape_routing": {
+        "bottle": "deepseek-chat"
+    },
+
+    "cloud_api_key": "YOUR_CLOUD_API_KEY_HERE",
+    "cloud_api_base": "https://api.minimax.io/v1",
+
+    "cloud_vision_model": "gemini-2.5-flash-lite",
+    "cloud_vision_models": [
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "MiniMax-M2.7"
+    ],
+    "backend": "cadquery",
+    "ast_validate": true,
+    "judge_enabled": true,
+    "judge_max_retries": 2,
+    "judge_min_score": 6,
+
+    "_comment_feature_flags": "Sprint 5-7 feature flags. Each = single point of rollback. Safe-to-enable group is on by default. sandbox_strict and best_of_n are in *shadow-mode* (compile-check only / extra-candidate logging only — neither alters user-facing response) for 1-week cost-vs-score data collection.",
+    "feature_flags": {
+        "output_cache":        true,
+        "structured_log":      true,
+        "geom_check":          true,
+        "print_readiness":     true,
+        "multi_format_export": true,
+        "sandbox_strict":      true,
+        "best_of_n":           true,
+        "slicer_check":        false,
+        "render_pyvista":      false
+    },
+    "_comment_slicer_path": "PrusaSlicer 2.9.4 portable installed on 195. slicer_check flag stays OFF until first-run GUI wizard is dismissed manually on the Windows console (otherwise headless --export-gcode hangs and every generate eats a 60s timeout).",
+    "slicer_path": "C:\\Tools\\PrusaSlicer\\PrusaSlicer-2.9.4\\prusa-slicer-console.exe",
+    "best_of_per_category": {
+        "figurine": 3,
+        "bottle":   2,
+        "teapot":   2,
+        "shoe":     2
+    }
 }
