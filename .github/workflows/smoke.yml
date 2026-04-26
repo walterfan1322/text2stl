@@ -26,6 +26,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pymeshfix scipy networkx pyvista RestrictedPython pymeshlab
+      - name: Seed config.json from example
+        run: cp config.example.json config.json
       - name: Run unit suites
         run: |
           set -e
@@ -72,6 +74,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pymeshfix scipy networkx
+      - name: Seed config.json from example
+        run: cp config.example.json config.json
       - name: Start server in background
         run: |
           nohup python -m uvicorn app:app --host 127.0.0.1 --port 8765 > server.log 2>&1 &
