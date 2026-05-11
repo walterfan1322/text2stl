@@ -24,6 +24,9 @@ log = logging.getLogger("text2stl.tokens")
 APPROX_USD_PER_1K: dict[str, float] = {
     "MiniMax-M2.7":         0.0030,
     "MiniMax-M2.5":         0.0020,
+    "deepseek-v4-flash":    0.0007,
+    "deepseek-v4-pro":      0.0020,
+    # legacy aliases (still resolvable by DeepSeek until 2026-07-24)
     "deepseek-chat":        0.0007,
     "deepseek-reasoner":    0.0020,
     "gemini-2.5-flash":     0.0015,

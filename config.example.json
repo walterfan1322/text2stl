@@ -1,7 +1,8 @@
 {
-    "ollama_url": "http://localhost:11434",
-    "ollama_model": "qwen3.5:35b-a3b",
-    "ssh_tunnel_host": "user@YOUR_DGX_HOST",
+    "_comment_ollama": "Local-Ollama path is OPTIONAL. Leave ollama_url empty + ollama_model set to a cloud model (e.g. MiniMax-M2.7) for cloud-only deployments (mac mini, server without GPU). Only fill ollama_url/ssh_tunnel_host if you actually have a local Ollama or a DGX you tunnel to.",
+    "ollama_url": "",
+    "ollama_model": "MiniMax-M2.7",
+    "ssh_tunnel_host": "",
     "ssh_key_path": "",
     "tunnel_idle_timeout": 900,
 
@@ -22,8 +23,8 @@
     "cloud_models": [
         "MiniMax-M2.7",
         "MiniMax-M2.5",
-        "deepseek-chat",
-        "deepseek-reasoner",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
         "gemini-2.0-flash"
@@ -31,23 +32,23 @@
     "model_provider": {
         "MiniMax-M2.7": "minimax",
         "MiniMax-M2.5": "minimax",
-        "deepseek-chat": "deepseek",
-        "deepseek-reasoner": "deepseek",
+        "deepseek-v4-flash": "deepseek",
+        "deepseek-v4-pro": "deepseek",
         "gemini-2.5-flash": "gemini",
         "gemini-2.5-flash-lite": "gemini",
         "gemini-2.0-flash": "gemini"
     },
     "model_failover": {
-        "MiniMax-M2.7": ["deepseek-chat"],
-        "MiniMax-M2.5": ["deepseek-chat"],
-        "deepseek-chat": ["MiniMax-M2.7"],
-        "gemini-2.5-flash": ["MiniMax-M2.7", "deepseek-chat"]
+        "MiniMax-M2.7": ["deepseek-v4-flash"],
+        "MiniMax-M2.5": ["deepseek-v4-flash"],
+        "deepseek-v4-flash": ["MiniMax-M2.7"],
+        "gemini-2.5-flash": ["MiniMax-M2.7", "deepseek-v4-flash"]
     },
 
     "_comment_shape_routing": "P3: route by inferred shape category (pattern_cache.infer_category). Based on trials=3 benchmark — MiniMax wins 5/12 shapes outright, ties 7, loses 0. Only bottle routes to DeepSeek (DeepSeek 100% pass-rate vs MiniMax 67%).",
     "shape_routing_enabled": true,
     "shape_routing": {
-        "bottle": "deepseek-chat"
+        "bottle": "deepseek-v4-flash"
     },
 
     "cloud_api_key": "YOUR_CLOUD_API_KEY_HERE",
@@ -79,8 +80,8 @@
         "render_pyvista":      false,
         "refine_diff_patch":   true
     },
-    "_comment_slicer_path": "PrusaSlicer 2.9.4 portable installed on 195. slicer_check flag stays OFF until first-run GUI wizard is dismissed manually on the Windows console (otherwise headless --export-gcode hangs and every generate eats a 60s timeout).",
-    "slicer_path": "C:\\Tools\\PrusaSlicer\\PrusaSlicer-2.9.4\\prusa-slicer-console.exe",
+    "_comment_slicer_path": "Optional. PrusaSlicer console binary path for the slicer_check flag. Leave empty if slicer_check is OFF (default). On macOS it's typically /Applications/PrusaSlicer.app/Contents/MacOS/PrusaSlicer; on Windows portable, e.g. C:\\Tools\\PrusaSlicer\\PrusaSlicer-2.9.4\\prusa-slicer-console.exe.",
+    "slicer_path": "",
     "best_of_per_category": {
         "figurine": 3,
         "bottle":   2,

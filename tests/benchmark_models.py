@@ -15,7 +15,7 @@ from pathlib import Path
 
 API = "http://127.0.0.1:8765"
 
-MODELS = ["MiniMax-M2.7", "deepseek-chat", "gemini-2.5-flash"]
+MODELS = ["MiniMax-M2.7", "deepseek-v4-flash", "gemini-2.5-flash"]
 PROMPTS = {
     "vase":        "一個花瓶",
     "pen_holder":  "一個圓筒筆筒",

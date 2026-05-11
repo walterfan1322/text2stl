@@ -23,38 +23,132 @@ from rendering import encode_pngs_as_data_urls
 log = logging.getLogger("text2stl.judge")
 
 
-JUDGE_SYSTEM_PROMPT = """You are a strict but fair 3D model reviewer.
-The user wants a specific real-world object to be 3D-printed.
-You will be shown 4 rendered views of a generated 3D model (isometric, front, side, top).
+JUDGE_SYSTEM_PROMPT = """You are a strict but fair 3D model reviewer using a CHECKLIST protocol.
+The user wants a SPECIFIC real-world object to be 3D-printed and your job is to
+verify that the rendered model actually matches THE OBJECT THE USER REQUESTED —
+NOT to describe what the silhouette happens to look like.
 
-Your job: judge whether the shape is RECOGNISABLE as the described object.
-Ignore surface texture, color, small blemishes — focus on overall silhouette and key structural features.
+You will be shown 4 rendered views of a generated 3D model (isometric, front,
+side, top) plus the user's request text.
 
-Respond with a STRICT JSON object. Do not include any text before or after the JSON.
-The JSON schema:
+VIEW USAGE GUIDE:
+- ISOMETRIC view shows the overall 3-D form. A 3-D box from iso angle
+  has a diamond/pyramid-shaped outline; do NOT mistake that 2-D outline
+  for the actual shape. Use the iso view together with the orthographic
+  views to assess form.
+- FRONT and SIDE views show the silhouette without 3-D foreshortening.
+  These are reliable for height-to-width proportions and overall shape.
+- TOP view is the PRIMARY view for assessing flat surface patterns,
+  grids, arrays of features (chessboard squares, keyboard keys, button
+  layouts, tile patterns). Surface bumps that are too short to see in
+  iso are usually clearly visible from the top via shading edges.
+
+When checking for a "checker pattern", "grid", or "array", look at the
+TOP view for visible cell-edge shading. A truly featureless slab will
+have a uniform top face; a chessboard will show 64 cell boundaries.
+
+PROTOCOL — you will do THREE things, in order, in a SINGLE JSON reply:
+
+(0) IDENTIFY THE REQUESTED OBJECT TYPE from the user's request (e.g.
+    "西洋棋盤" → "chessboard"; "a water bottle" → "bottle"). All checks
+    you propose in step 1 must be checks for THIS REQUESTED TYPE,
+    regardless of what the rendered silhouette appears to show.
+
+(1) PROPOSE 4-6 binary structural checks the object MUST satisfy to be
+    recognisable as THE REQUESTED OBJECT TYPE. Each check is a yes/no
+    question about geometry — not surface finish, not color, not mesh
+    quality. Phrase each check so that "yes" = the model matches the
+    REQUESTED object's expectations.
+
+    The FIRST check is MANDATORY and FIXED:
+      "Does the overall silhouette resemble a <REQUESTED OBJECT TYPE>?"
+    Answer this honestly based on the rendered views, **using the FRONT,
+    SIDE, and TOP views as primary evidence — NOT the isometric view's
+    diamond-shaped outline**. (Iso outline of a flat slab is a diamond,
+    which can be mistaken for a pyramid; check the side / front view to
+    confirm.) If the model is obviously a different shape (e.g. a true
+    pyramid when the user asked for a chessboard, where the side view
+    shows tapered triangular profile), the answer MUST be "no". For
+    flat / planar objects (chessboard, keyboard, plate, tile), a flat
+    slab profile in side/front view is CORRECT — answer "yes" — but
+    THEN check the top view for the expected pattern in subsequent
+    checks; do NOT pass an unpatterned slab.
+
+    Checks 2-N are object-specific structural checks for the requested
+    type (presence of distinctive parts, part count, attachment topology,
+    proportions, axis orientation, cavities for containers, etc.).
+
+(2) ANSWER each check with "yes", "no", or "unclear", citing one short
+    evidence string from the rendered views. "unclear" is for cases where
+    none of the four views can resolve the question (occluded, tiny, etc).
+
+Then respond with a STRICT JSON object. No prose before or after the JSON.
+
+Schema:
 {
-  "identifiable": true | false,
-  "category": "what you actually see (e.g. 'vase', 'blob', 'flat plate')",
-  "match_score": integer 1-10 (10 = perfect match, 1 = totally wrong),
-  "geometry_issues": ["short bullet points about what's wrong, if anything"],
-  "fix_suggestion": "one short sentence that NAMES the CadQuery operation to use"
+  "requested_object": "<short noun phrase, normalized from the user request>",
+  "rendered_silhouette": "<what the silhouette actually depicts, in your honest opinion>",
+  "checks": [
+    {"q": "Does the overall silhouette resemble a <requested_object>?",
+     "answer": "yes" | "no" | "unclear",
+     "evidence": "<short, view-grounded reason>"},
+    {"q": "<object-specific structural check>", "answer": "...",
+     "evidence": "..."},
+    ...
+  ],
+  "fix_suggestion": "<one CONCRETE CadQuery directive for the failed checks; NAME the op>"
 }
 
-When writing `fix_suggestion`, be CONCRETE and NAME the operation. The
-downstream code-gen LLM needs a clear directive, not generic advice.
+Rules for `checks`:
+- Provide 4-6 checks (no fewer, no more), with the silhouette-resemblance
+  check as the FIRST one.
+- Each `q` must be answerable from the four views alone.
+- For container objects (planter, vase, mug, bowl, cup, box): one of the
+  remaining checks MUST ask about a hollow interior / open top.
+- For multi-part objects (chair, car, hammer): one of the remaining checks
+  MUST ask about attachment / part-count.
+- Do NOT pad with cosmetic checks ("is it smooth?"). Only structural.
 
-Good fix_suggestion examples:
-- "Use LOFT between two DIFFERENT foot-shaped outlines, not REVOLVE of a circle."
-- "Add a SWEEP handle attached to the outer wall at Z=25 and Z=75."
-- "Hollow the interior with .cut() of a smaller cylinder; it's currently solid."
-- "Build as COMPOSITE of 4 leg boxes + seat slab, unioned."
-- "Re-extrude the side profile with an angled back (~75°) instead of a vertical wall."
+Rules for `answer`:
+- Be honest. If the silhouette obviously does NOT match the requested
+  object, answer "no" on the first check and let the score reflect it.
+- "unclear" counts as a half-pass — use it only when truly ambiguous.
 
-Bad fix_suggestion examples (too vague — DO NOT write these):
-- "Improve the shape."
-- "Make it look more like a shoe."
-- "Adjust dimensions."
+Rules for `fix_suggestion`:
+- Concrete CadQuery operation. Bad: "make it more like a chair." Good:
+  "Add 4 separate leg boxes unioned to a seat slab; current legs are
+  embedded in the seat."
+- If all checks pass, set fix_suggestion to "" (empty string).
+
+Examples of good check sets:
+- Request "chessboard" (FIRST check fixed, then 3-5 type checks):
+  1. "Does the overall silhouette resemble a chessboard?"
+  2. "Is there an 8x8 grid of square cells visible on the top face?"
+  3. "Do alternating cells differ from their neighbours in height or color?"
+  4. "Is the overall shape a flat square slab (not a pyramid or block)?"
+- Request "chair" (FIRST check fixed, then 3-5 type checks):
+  1. "Does the overall silhouette resemble a chair?"
+  2. "Are there exactly 4 distinct legs visible from below?"
+  3. "Is the seat attached on top of the legs (not floating, embedded)?"
+  4. "Is there a backrest extending upward from one edge of the seat?"
+- Request "water bottle" (FIRST check fixed, then 3-5 type checks):
+  1. "Does the overall silhouette resemble a water bottle?"
+  2. "Is the body roughly cylindrical with a narrower neck on top?"
+  3. "Is there a visible hollow interior / opening at the top?"
+  4. "Is the height-to-width ratio approximately 2:1 to 4:1?"
 """
+
+
+# P1 (2026-04-28): keywords that bump the clamp ceiling DOWN to 4.
+# When a judge issue contains any of these, the model has fundamental
+# structural problems and we don't want a score of 5 to slip through.
+_SEVERE_ISSUE_KEYWORDS = (
+    "not attached", "not connected", "disconnect", "floating", "detached",
+    "missing", "wrong orientation", "wrong axis", "upside down",
+    "intersect", "passes through", "embedded in",
+    "no leg", "no head", "no body", "no handle", "no wheel",
+    "lacks", "doesn't have", "does not have",
+)
 
 
 @dataclass
@@ -65,6 +159,27 @@ class JudgeResult:
     geometry_issues: list[str]
     fix_suggestion: str
     raw_response: str = ""
+    # P1 (2026-04-28): server-side clamp telemetry. Kept for backwards
+    # compat with dashboards that read this field. With the Q&A protocol
+    # the score is derived from passed/total directly so clamp is rarely
+    # invoked, but legacy `match_score`-only responses still go through it.
+    clamped_from: int | None = None
+    # P5 (2026-04-28): structured Q&A protocol fields. `checks` is the
+    # list of {q, answer, evidence} dicts the VLM produced. `passed` and
+    # `total` are derived counts. Empty list means the VLM returned a
+    # legacy-format response (handled by fallback parser below).
+    checks: list[dict] | None = None
+    passed: int | None = None
+    total: int | None = None
+    # P3.5 (2026-04-29): category-match flag derived from the MANDATORY
+    # first check ("Does the overall silhouette resemble a <requested>?").
+    # `False` means the VLM judged the silhouette as NOT matching the
+    # requested object — this MUST gate the retry loop regardless of the
+    # other checks' scores. `None` means we couldn't infer a verdict
+    # (legacy responses, parse error, or judge disabled).
+    category_match: bool | None = None
+    requested_object: str | None = None
+    rendered_silhouette: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -75,11 +190,9 @@ class JudgeResult:
     def from_response(cls, text: str) -> "JudgeResult":
         """Parse the VLM's JSON reply. Tolerates fence markers and extra text."""
         raw = text.strip()
-        # Strip markdown fences
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*\n", "", raw)
             raw = re.sub(r"\n```\s*$", "", raw)
-        # Extract the first {...} block in case there's preamble
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             raw = m.group(0)
@@ -95,19 +208,134 @@ class JudgeResult:
                 fix_suggestion="Regenerate — previous output was not parseable.",
                 raw_response=text,
             )
-        # match_score may come back as int, float, or stringified int
+
+        # P3.5 (2026-04-29): preferred new fields, with backward-compat
+        # fallback to the legacy `category` key.
+        requested_object = data.get("requested_object")
+        rendered_silhouette = data.get("rendered_silhouette")
+        category = str(data.get("category",
+                                rendered_silhouette or
+                                requested_object or
+                                "unknown"))
+        fix_suggestion = str(data.get("fix_suggestion", ""))
+        checks_raw = data.get("checks")
+
+        # New Q&A protocol path
+        if isinstance(checks_raw, list) and checks_raw:
+            normalised: list[dict] = []
+            for c in checks_raw:
+                if not isinstance(c, dict):
+                    continue
+                ans = str(c.get("answer", "")).strip().lower()
+                if ans not in ("yes", "no", "unclear"):
+                    ans = "unclear"
+                normalised.append({
+                    "q": str(c.get("q", "")).strip()[:200],
+                    "answer": ans,
+                    "evidence": str(c.get("evidence", "")).strip()[:200],
+                })
+            total = len(normalised)
+            # P3.5: derive category_match from the MANDATORY first check
+            # ("Does the overall silhouette resemble a <requested>?").
+            # We detect it heuristically by looking for "resemble" or
+            # "look like" in the first check's question; if not found,
+            # we leave category_match = None to avoid false positives.
+            cat_match: bool | None = None
+            if normalised:
+                first_q = normalised[0]["q"].lower()
+                if any(kw in first_q for kw in (
+                        "resemble", "look like", "looks like",
+                        "resembles", "appear as", "appear to be")):
+                    first_ans = normalised[0]["answer"]
+                    if first_ans == "yes":
+                        cat_match = True
+                    elif first_ans == "no":
+                        cat_match = False
+                    # "unclear" -> leave None (don't gate, but don't endorse)
+            # yes = 1, unclear = 0.5, no = 0
+            score_units = sum(
+                1.0 if c["answer"] == "yes"
+                else 0.5 if c["answer"] == "unclear"
+                else 0.0
+                for c in normalised
+            )
+            passed = sum(1 for c in normalised if c["answer"] == "yes")
+            if total > 0:
+                # Floor at 1, cap at 10. round() to integer.
+                score = max(1, min(10, round((score_units / total) * 10)))
+            else:
+                score = None
+            # P3.5: if category_match is False, hard-cap the score at 3.
+            # The structural checks below the silhouette one cannot redeem
+            # a fundamentally-wrong-shape model.
+            if cat_match is False and score is not None:
+                if score > 3:
+                    log.warning(
+                        f"Judge clamped {score} -> 3 because category_match=False "
+                        f"(requested={requested_object!r}, "
+                        f"rendered={rendered_silhouette!r})"
+                    )
+                    score = 3
+            issues = [
+                f"{c['q']} → NO ({c['evidence']})"
+                for c in normalised if c["answer"] == "no"
+            ]
+            unclear = [
+                f"{c['q']} → UNCLEAR ({c['evidence']})"
+                for c in normalised if c["answer"] == "unclear"
+            ]
+            issues.extend(unclear)
+            # P3.5: identifiable now requires both passed >= half AND not
+            # category-mismatched. A pyramid-when-asked-for-chessboard
+            # cannot be "identifiable" no matter how many secondary checks
+            # the VLM was forced to pass.
+            identifiable_q = (passed >= max(1, total // 2)) if total > 0 else False
+            identifiable = identifiable_q and (cat_match is not False)
+            return cls(
+                identifiable=identifiable,
+                category=category,
+                match_score=score,
+                geometry_issues=issues,
+                fix_suggestion=fix_suggestion,
+                raw_response=text,
+                checks=normalised,
+                passed=passed,
+                total=total,
+                category_match=cat_match,
+                requested_object=str(requested_object) if requested_object else None,
+                rendered_silhouette=str(rendered_silhouette) if rendered_silhouette else None,
+            )
+
+        # Legacy path — VLM didn't follow Q&A protocol. Treat as before.
         raw_score = data.get("match_score", 5)
         try:
-            score: int | None = int(raw_score)
+            score = int(raw_score)
         except (TypeError, ValueError):
             score = None
+        issues = list(data.get("geometry_issues", []))
+
+        clamped_from: int | None = None
+        if score is not None and issues:
+            ceiling = 5
+            joined = " ".join(issues).lower()
+            if any(kw in joined for kw in _SEVERE_ISSUE_KEYWORDS):
+                ceiling = 4
+            if score > ceiling:
+                clamped_from = score
+                log.warning(
+                    f"Judge clamped {score} -> {ceiling} "
+                    f"(issues={len(issues)}, ceiling={ceiling})"
+                )
+                score = ceiling
+
         return cls(
             identifiable=bool(data.get("identifiable", False)),
-            category=str(data.get("category", "unknown")),
+            category=category,
             match_score=score,
-            geometry_issues=list(data.get("geometry_issues", [])),
-            fix_suggestion=str(data.get("fix_suggestion", "")),
+            geometry_issues=issues,
+            fix_suggestion=fix_suggestion,
             raw_response=text,
+            clamped_from=clamped_from,
         )
 
 
@@ -259,8 +487,72 @@ async def judge_model(
 
 def build_retry_instruction(description: str, previous_code: str, judge: JudgeResult) -> str:
     """Build a user message that feeds the judge's feedback back to the LLM."""
-    issues = "\n".join(f"- {i}" for i in judge.geometry_issues) or "- (none listed)"
     score_s = f"{judge.match_score}/10" if judge.match_score is not None else "unscored"
+
+    # P5 (2026-04-28): structured Q&A retry. List passed checks (so the LLM
+    # knows what to PRESERVE) and failed checks (so it knows what to FIX).
+    if judge.checks:
+        passed_lines = [
+            f"  ✓ {c['q']}" for c in judge.checks if c["answer"] == "yes"
+        ]
+        failed_lines = [
+            f"  ✗ {c['q']}\n      → reviewer says: {c['evidence']}"
+            for c in judge.checks if c["answer"] == "no"
+        ]
+        unclear_lines = [
+            f"  ? {c['q']}\n      → reviewer says: {c['evidence']}"
+            for c in judge.checks if c["answer"] == "unclear"
+        ]
+        passed_block = "\n".join(passed_lines) or "  (none)"
+        failed_block = "\n".join(failed_lines) or "  (none)"
+        unclear_block = "\n".join(unclear_lines) or "  (none)"
+
+        # P3.7 (2026-04-29): split retry framing by whether the silhouette
+        # ITSELF is wrong vs only secondary structural checks failed.
+        # When category_match is False, telling the LLM "the model looks
+        # like X, you wanted Y" causes it to scrap the design wholesale —
+        # which is correct. When category_match is True (silhouette OK,
+        # only details wrong), the previous framing was misleading: it
+        # reported `category` (which falls back to `rendered_silhouette`)
+        # as "judged as 'a pyramid'", and the LLM would strip out the
+        # very features that made it match — regressing the design. Now
+        # we tell it explicitly: silhouette is OK, just refine the
+        # failed checks.
+        if judge.category_match is False:
+            req = judge.requested_object or description
+            rendered = judge.rendered_silhouette or judge.category
+            header = (
+                f"The previous code produced a 3D model whose overall shape "
+                f"was interpreted as {rendered!r}, NOT a {req!r} as requested. "
+                f"This is a fundamental form mismatch — re-design the model "
+                f"from scratch with the CORRECT overall {req} silhouette. "
+                f"(score {score_s})"
+            )
+        else:
+            header = (
+                f"The previous code's overall silhouette MATCHES the requested "
+                f"{description!r} — DO NOT redesign it from scratch. The score "
+                f"({score_s}) is held back by specific failed checks below; "
+                f"REFINE the code to fix only those, while keeping every "
+                f"passed feature intact."
+            )
+
+        return (
+            f"{header}\n\n"
+            f"PASSED checks (preserve these — your code already gets them right):\n"
+            f"{passed_block}\n\n"
+            f"FAILED checks (fix these — these are the reasons the score is low):\n"
+            f"{failed_block}\n\n"
+            f"UNCLEAR checks (make sure these read clearly from all 4 views):\n"
+            f"{unclear_block}\n\n"
+            f"Suggested operation: {judge.fix_suggestion}\n\n"
+            f"Regenerate code for \"{description}\" that satisfies the FAILED "
+            f"checks while preserving the PASSED ones. Follow the PLAN-THEN-CODE "
+            f"protocol from the system prompt. Output ONLY the complete code."
+        )
+
+    # Legacy path
+    issues = "\n".join(f"- {i}" for i in judge.geometry_issues) or "- (none listed)"
     return (
         f"The previous code produced a 3D model that was judged as: "
         f"{judge.category!r} (score {score_s}).\n"

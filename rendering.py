@@ -64,6 +64,17 @@ def render_stl_views(
         except Exception as e:
             log.warning(f"pyvista rendering failed, falling back: {e}")
 
+    # macOS portability: trimesh.Scene.save_image internally calls pyglet,
+    # which on Darwin instantiates an NSWindow. Cocoa requires NSWindow on
+    # the MAIN thread, but uvicorn runs request handlers on worker threads,
+    # so the call uncaughtly aborts the entire python process with
+    # `NSInternalInconsistencyException`. The exception is *not* a Python
+    # exception — `try/except` won't catch it. Skip straight to matplotlib
+    # (Agg backend, headless) which is fine on all platforms.
+    import sys as _sys
+    if _sys.platform == "darwin":
+        return _render_with_matplotlib(stl_path, out_dir, resolution, angles)
+
     try:
         paths = _render_with_trimesh(stl_path, out_dir, resolution, angles)
         # On Windows hosts that fall through to GDI Generic (OpenGL 1.1),

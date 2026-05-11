@@ -26,6 +26,14 @@ token_usage.jsonl
 # Backups
 *.bak*
 app.py.bak*
+app.py.macmini
+config.fetched.json
+
+# Scratch / investigation / deploy scripts (walter's `_` convention).
+# These often hardcode passwords (mac mini SSH) or contain raw debug data
+# (LLM responses, benchmark logs, render artifacts). Never commit them.
+_*
+HANDOFF_*.md
 
 # Python
 __pycache__/

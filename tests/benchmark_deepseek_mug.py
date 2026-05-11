@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from benchmark_models import run_one
 
-MODEL = "deepseek-chat"
+MODEL = "deepseek-v4-flash"
 TRIALS = 5
 PROMPT = "一個有把手的馬克杯"
 

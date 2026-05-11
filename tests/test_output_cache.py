@@ -46,7 +46,7 @@ class OutputCacheTest(unittest.TestCase):
     def test_different_model_no_pollution(self):
         self._make_job("job1")
         self.cache.store("a vase", "MiniMax-M2.7", "sys", "job1", 9)
-        self.assertIsNone(self.cache.lookup("a vase", "deepseek-chat", "sys"))
+        self.assertIsNone(self.cache.lookup("a vase", "deepseek-v4-flash", "sys"))
 
     def test_different_sys_prompt_no_pollution(self):
         self._make_job("job1")

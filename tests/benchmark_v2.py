@@ -23,10 +23,11 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-API = "http://127.0.0.1:8765"
-TIMEOUT = 300  # judge loop can take a while on hard shapes
+import os
+API = os.environ.get("TEXT2STL_API", "http://127.0.0.1:8765")
+TIMEOUT = int(os.environ.get("TEXT2STL_TIMEOUT", "600"))  # judge loop on hard shapes
 
-DEFAULT_MODELS = ["MiniMax-M2.7", "deepseek-chat"]
+DEFAULT_MODELS = ["MiniMax-M2.7", "deepseek-v4-flash"]
 
 # 12 shapes organised by difficulty tier (tier comment is informational)
 DEFAULT_PROMPTS: dict[str, str] = {
@@ -70,11 +71,15 @@ def post(path: str, body: dict, timeout: int = TIMEOUT) -> tuple[int, dict]:
 
 
 def download_and_check(stl_url: str) -> tuple[bool, dict]:
-    """Download STL, load with trimesh, return stats (incl. watertight)."""
-    import trimesh  # lazy
+    """Download STL and return stats. Uses trimesh if available; otherwise
+    falls back to a binary-STL header parser (no watertight check)."""
     try:
         with urllib.request.urlopen(f"{API}{stl_url}", timeout=30) as r:
             blob = r.read()
+    except Exception as e:
+        return False, {"error": str(e)[:100]}
+    try:
+        import trimesh  # lazy
         tmp = Path(f"/tmp/bench_{int(time.time()*1000)}.stl")
         tmp.write_bytes(blob)
         m = trimesh.load(str(tmp))
@@ -87,6 +92,18 @@ def download_and_check(stl_url: str) -> tuple[bool, dict]:
         }
         tmp.unlink(missing_ok=True)
         return len(m.vertices) > 10 and len(m.faces) > 10, stats
+    except ModuleNotFoundError:
+        # Fallback: binary-STL header parse (no watertight)
+        try:
+            import struct
+            n_tri = struct.unpack("<I", blob[80:84])[0]
+            return n_tri > 4, {
+                "size_kb": len(blob) // 1024,
+                "triangles": n_tri,
+                "watertight": None,
+            }
+        except Exception as e:
+            return False, {"error": f"stl-parse: {e}"[:100]}
     except Exception as e:
         return False, {"error": str(e)[:100]}
 

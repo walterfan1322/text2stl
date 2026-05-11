@@ -13,3 +13,7 @@ cadquery>=2.4
 # Optional: more aggressive mesh repair (S4.1). Safe to omit — mesh_repair
 # falls back to trimesh.repair only, and skips pymeshfix if not importable.
 pymeshfix
+# matplotlib is the platform-portable rendering fallback. On macOS the
+# trimesh+pyglet path crashes (NSWindow on non-main thread), so rendering
+# always falls through to matplotlib's Agg backend there.
+matplotlib

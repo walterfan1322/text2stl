@@ -499,12 +499,25 @@ def validate_cadquery(code: str) -> ValidationResult:
     # vertex counts across all sections; mismatched counts produce degenerate
     # geometry (or fail at exec with an opaque BRep error). Catching it here
     # gives the LLM a clear, actionable retry message.
+    extra: list[str] = []
     try:
-        loft_errs = check_loft_topology(code)
+        extra += check_loft_topology(code)
     except Exception:
-        loft_errs = []
-    if loft_errs:
-        merged = list(res.errors) + loft_errs
+        pass
+    try:
+        extra += check_closed_primitive_misuse(code)
+    except Exception:
+        pass
+    try:
+        extra += check_fillet_after_boolean(code)
+    except Exception:
+        pass
+    try:
+        extra += check_2d_path_arity(code)
+    except Exception:
+        pass
+    if extra:
+        merged = list(res.errors) + extra
         return ValidationResult(ok=False, errors=merged)
     return res
 
@@ -586,6 +599,198 @@ def check_loft_topology(code: str) -> list[str]:
                 f"foot-shaped XY footprint extruded vertically. Cut a cylinder "
                 f"for the ankle opening. NO .loft() needed."
             )
+    return errors
+
+
+def check_closed_primitive_misuse(code: str) -> list[str]:
+    """Reject `.circle(...).close()`, `.rect(...).close()`, `.ellipse(...).close()`.
+
+    CadQuery primitives `.circle()`, `.rect()`, `.ellipse()` already return a
+    closed wire. Chaining `.close()` on them and then calling `.extrude()` (or
+    other 2D→3D ops) raises an opaque
+    `ValueError: Cannot convert object type Wire to vector`
+    at exec time. The LLM can repeat this bug across all retries because
+    the runtime error doesn't tell it where the misuse is.
+
+    We only flag the IMMEDIATE chain (close() called directly on a primitive
+    Call). A polyline/sketch with manual segments + .close() is fine; this
+    function deliberately does not touch those.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    closed_primitives = {"circle", "rect", "ellipse"}
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "close"):
+            continue
+        receiver = node.func.value
+        # Receiver must itself be a Call whose method is a closed primitive
+        if not (isinstance(receiver, ast.Call)
+                and isinstance(receiver.func, ast.Attribute)):
+            continue
+        prim = receiver.func.attr
+        if prim not in closed_primitives:
+            continue
+        line = getattr(node, "lineno", "?")
+        errors.append(
+            f"line {line}: `.{prim}(...).close()` is invalid — "
+            f"`.{prim}()` already returns a closed wire. Chaining `.close()` "
+            f"and then `.extrude()` raises "
+            f"'Cannot convert object type Wire to vector' at exec time. "
+            f"FIX: drop the `.close()`. Write `.{prim}(...).extrude(h)` "
+            f"directly. Use `.close()` only after manual sketch segments "
+            f"like `.polyline(...)`, `.lineTo(...)`, `.threePointArc(...)`."
+        )
+    return errors
+
+
+def check_fillet_after_boolean(code: str) -> list[str]:
+    """Reject `.fillet(...)` or `.chamfer(...)` whose receiver chain includes
+    a boolean operation (`.union`, `.cut`, `.intersect`).
+
+    Filleting the result of a boolean union is the single most reliable way to
+    crash the OCC kernel with `BRep_API: command not done`. The edges produced
+    by a union are often non-manifold or share tangent points that the fillet
+    algorithm cannot resolve. The system prompt already warns about this
+    ("apply fillet to a SINGLE primitive BEFORE union") but the LLM ignores
+    it across retries — programmatic enforcement is the only reliable fix.
+
+    We flag direct chains like `.union(x).fillet(...)` AND chains where the
+    boolean op appears earlier in the receiver chain via `.edges(...)`,
+    `.faces(...)`, etc. (e.g. `.union(x).edges("|Z").fillet(2)`).
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    boolean_ops = {"union", "cut", "intersect"}
+    edge_ops = {"fillet", "chamfer"}
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in edge_ops):
+            continue
+        # Walk the receiver chain looking for a boolean op anywhere.
+        cursor: ast.AST | None = node.func.value
+        found_bool: str | None = None
+        while isinstance(cursor, ast.Call) and isinstance(cursor.func, ast.Attribute):
+            if cursor.func.attr in boolean_ops:
+                found_bool = cursor.func.attr
+                break
+            cursor = cursor.func.value
+        # Also catch the case where the receiver is a Name pointing at a
+        # variable whose RHS contains a boolean op (e.g.
+        #   result = a.union(b).union(c)
+        #   result = result.edges("|Z").fillet(2)).
+        if found_bool is None and isinstance(node.func.value, (ast.Name, ast.Call)):
+            target_name = None
+            if isinstance(node.func.value, ast.Name):
+                target_name = node.func.value.id
+            else:
+                # Walk back to root of chain; if it's a Name, use its id.
+                root = node.func.value
+                while isinstance(root, ast.Call) and isinstance(root.func, ast.Attribute):
+                    root = root.func.value
+                if isinstance(root, ast.Name):
+                    target_name = root.id
+            if target_name is not None:
+                # Scan assignments to target_name that occur BEFORE this
+                # fillet line for a boolean op in their RHS. Order matters —
+                # a later `cabin = cabin.cut(...)` does NOT mean a prior
+                # `cabin = cabin.fillet(...)` was invalid.
+                fillet_line = getattr(node, "lineno", 10**9)
+                for assign in ast.walk(tree):
+                    if not (isinstance(assign, ast.Assign)
+                            and any(isinstance(t, ast.Name) and t.id == target_name
+                                    for t in assign.targets)):
+                        continue
+                    if getattr(assign, "lineno", 0) >= fillet_line:
+                        continue
+                    for sub in ast.walk(assign.value):
+                        if (isinstance(sub, ast.Call)
+                                and isinstance(sub.func, ast.Attribute)
+                                and sub.func.attr in boolean_ops):
+                            found_bool = sub.func.attr
+                            break
+                    if found_bool is not None:
+                        break
+        if found_bool is None:
+            continue
+        line = getattr(node, "lineno", "?")
+        errors.append(
+            f"line {line}: `.{node.func.attr}(...)` applied AFTER `.{found_bool}(...)` "
+            f"is invalid — filleting/chamfering the result of a boolean op "
+            f"crashes the OCC kernel ('BRep_API: command not done'). "
+            f"FIX: apply `.fillet()` / `.chamfer()` to each PRIMITIVE BEFORE "
+            f"combining. Build each piece, fillet it, then `.union()` the "
+            f"filleted pieces. Or simply remove the fillet — sharp edges "
+            f"render fine. Do not fillet a unioned/cut/intersected solid."
+        )
+    return errors
+
+
+def check_2d_path_arity(code: str) -> list[str]:
+    """Reject 3-argument `.moveTo(x,y,z)` / `.lineTo(x,y,z)` / `.hLineTo(x,y)`
+    (one positional too many).
+
+    `Workplane.moveTo()` and `.lineTo()` are 2-D operations on the active
+    workplane — signature is `(x, y)`. The LLM occasionally hallucinates a
+    3-coord variant ("but we're sketching in 3D space, surely it takes z?"),
+    producing
+        TypeError: Workplane.moveTo() takes from 1 to 3 positional arguments
+                   but 4 were given
+    at exec time. The error is doubly opaque because cadquery counts `self`
+    as a positional. Catch the misuse before exec so the retry message is
+    actionable.
+
+    We flag positional-arg counts only — kwargs and **expansions stay
+    untouched. `.lineTo(x, y)` with two args is fine; three is rejected.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    # method -> max allowed positional args (NOT counting self)
+    arity_caps = {
+        "moveTo":  2,   # (x, y)
+        "lineTo":  2,   # (x, y)
+        "hLineTo": 1,   # (x)
+        "vLineTo": 1,   # (y)
+        "hLine":   1,   # (dx)
+        "vLine":   1,   # (dy)
+    }
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)):
+            continue
+        method = node.func.attr
+        cap = arity_caps.get(method)
+        if cap is None:
+            continue
+        # Count plain positionals (skip *args expansions to avoid false positives)
+        n_pos = sum(1 for a in node.args if not isinstance(a, ast.Starred))
+        if n_pos <= cap:
+            continue
+        line = getattr(node, "lineno", "?")
+        errors.append(
+            f"line {line}: `.{method}(...)` got {n_pos} positional args but "
+            f"accepts at most {cap}. `.{method}()` is a 2-D path op on the "
+            f"active workplane — signature is "
+            f"{'(x, y)' if cap == 2 else '(value)'}. The third coordinate is "
+            f"NOT a Z value; raise the workplane via `.workplane(offset=z)` "
+            f"BEFORE the 2-D sketch instead. Common mistake: "
+            f"`.moveTo(10, 5, 0)` should be `.moveTo(10, 5)` (with the "
+            f"workplane already at z=0)."
+        )
     return errors
 
 

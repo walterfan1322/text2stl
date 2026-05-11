@@ -42,7 +42,22 @@ CATEGORY_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("chair",      ("chair", "stool", "椅子", "凳子", "板凳")),
     ("table",      ("table", "desk", "桌子", "書桌")),
     ("figurine",   ("figurine", "snowman", "雪人", "公仔", "娃娃")),
+    # Order: keychain before key, so "鑰匙圈" / "keychain" don't get mis-bucketed.
     ("keychain",   ("keychain", "pendant", "鑰匙圈", "吊飾", "項鍊")),
+    ("key",        ("key", "鑰匙")),
+    # P4 (2026-04-28): organic/named-object categories — these were falling
+    # into "misc" and getting no orientation hint, no canonical recipe.
+    ("dog",        ("dog", "puppy", "cat", "kitten", "horse", "cow",
+                    "quadruped", "animal",
+                    "狗", "小狗", "貓", "小貓", "馬", "牛", "動物")),
+    ("tree",       ("tree", "bush", "shrub",
+                    "樹", "樹木")),
+    ("hammer",     ("hammer", "錘子", "鐵鎚")),
+    ("screwdriver",("screwdriver", "wrench", "spanner", "螺絲起子", "扳手")),
+    ("car",        ("car", "truck", "bus", "vehicle", "automobile",
+                    "汽車", "車子", "卡車", "巴士")),
+    ("house",      ("house", "building", "cottage", "cabin",
+                    "房子", "房屋", "建築", "小屋")),
 ]
 
 

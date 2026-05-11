@@ -33,32 +33,32 @@ class ShapeRoutingTest(unittest.TestCase):
     def test_disabled_routing_honors_user_choice(self):
         self.app.SHAPE_ROUTING_ENABLED = False
         self.app.SHAPE_ROUTING.clear()
-        self.app.SHAPE_ROUTING["bottle"] = "deepseek-chat"
+        self.app.SHAPE_ROUTING["bottle"] = "deepseek-v4-flash"
         self.assertEqual(self._route("a bottle", "MiniMax-M2.7"), "MiniMax-M2.7")
 
     def test_routing_overrides_for_matched_category(self):
         self.app.SHAPE_ROUTING_ENABLED = True
         self.app.SHAPE_ROUTING.clear()
-        self.app.SHAPE_ROUTING["bottle"] = "deepseek-chat"
-        self.assertEqual(self._route("a bottle", "MiniMax-M2.7"), "deepseek-chat")
+        self.app.SHAPE_ROUTING["bottle"] = "deepseek-v4-flash"
+        self.assertEqual(self._route("a bottle", "MiniMax-M2.7"), "deepseek-v4-flash")
 
     def test_routing_no_match_keeps_user_choice(self):
         self.app.SHAPE_ROUTING_ENABLED = True
         self.app.SHAPE_ROUTING.clear()
-        self.app.SHAPE_ROUTING["bottle"] = "deepseek-chat"
+        self.app.SHAPE_ROUTING["bottle"] = "deepseek-v4-flash"
         self.assertEqual(self._route("a vase", "MiniMax-M2.7"), "MiniMax-M2.7")
 
     def test_chinese_prompt_routes(self):
         self.app.SHAPE_ROUTING_ENABLED = True
         self.app.SHAPE_ROUTING.clear()
-        self.app.SHAPE_ROUTING["bottle"] = "deepseek-chat"
-        self.assertEqual(self._route("一個瓶子", "MiniMax-M2.7"), "deepseek-chat")
+        self.app.SHAPE_ROUTING["bottle"] = "deepseek-v4-flash"
+        self.assertEqual(self._route("一個瓶子", "MiniMax-M2.7"), "deepseek-v4-flash")
 
     def test_ollama_user_choice_not_hijacked(self):
         """If user picks a local Ollama model, don't silently push to cloud."""
         self.app.SHAPE_ROUTING_ENABLED = True
         self.app.SHAPE_ROUTING.clear()
-        self.app.SHAPE_ROUTING["bottle"] = "deepseek-chat"
+        self.app.SHAPE_ROUTING["bottle"] = "deepseek-v4-flash"
         # 'qwen3.5:35b-a3b' is not in cloud_models
         self.assertEqual(self._route("a bottle", "qwen3.5:35b-a3b"),
                          "qwen3.5:35b-a3b")
@@ -66,13 +66,13 @@ class ShapeRoutingTest(unittest.TestCase):
     def test_empty_user_model_still_routes(self):
         self.app.SHAPE_ROUTING_ENABLED = True
         self.app.SHAPE_ROUTING.clear()
-        self.app.SHAPE_ROUTING["bottle"] = "deepseek-chat"
-        self.assertEqual(self._route("a bottle", None), "deepseek-chat")
+        self.app.SHAPE_ROUTING["bottle"] = "deepseek-v4-flash"
+        self.assertEqual(self._route("a bottle", None), "deepseek-v4-flash")
 
     def test_misc_prompt_no_override(self):
         self.app.SHAPE_ROUTING_ENABLED = True
         self.app.SHAPE_ROUTING.clear()
-        self.app.SHAPE_ROUTING["bottle"] = "deepseek-chat"
+        self.app.SHAPE_ROUTING["bottle"] = "deepseek-v4-flash"
         # 'quasar' → misc → no override
         self.assertEqual(self._route("a quasar", "MiniMax-M2.7"), "MiniMax-M2.7")
 

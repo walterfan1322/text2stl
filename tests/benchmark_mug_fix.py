@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from benchmark_models import run_one
 
-MODELS = ["MiniMax-M2.7", "deepseek-chat", "gemini-2.5-flash-lite"]
+MODELS = ["MiniMax-M2.7", "deepseek-v4-flash", "gemini-2.5-flash-lite"]
 TRIALS = 2
 PROMPT = "一個有把手的馬克杯"
 

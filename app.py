@@ -30,6 +30,14 @@ from validators import (
 from backends import get_backend, BackendError
 from rendering import render_stl_views
 from judge import judge_model, build_retry_instruction, JudgeResult
+# P3.1 (2026-04-29): image-grounded self-correction
+from image_gen import generate_reference_image
+from silhouette_iou import silhouette_iou as compute_silhouette_iou
+from image_critic import (
+    critique as run_image_critic,
+    build_critic_retry_block,
+    CritiqueResult,
+)
 
 # Directories
 BASE_DIR = Path(__file__).parent
@@ -64,6 +72,15 @@ def _load_env_local(p: Path) -> dict:
 
 
 _env_local = _load_env_local(BASE_DIR / ".env.local")
+
+# P3.1 (2026-04-29): also promote .env.local entries into os.environ so
+# child modules that read os.environ.get(...) directly (image_gen.py
+# reads FAL_KEY this way) see the same values without each module
+# needing its own dotenv loader. Existing real-env values are NOT
+# overwritten — real env still wins.
+for _k, _v in _env_local.items():
+    if _k not in os.environ:
+        os.environ[_k] = _v
 
 
 def _env_or(name: str, default=None):
@@ -104,7 +121,7 @@ CLOUD_VISION_MODELS = _cfg.get("cloud_vision_models", [])
 # S1.6: per-model failover chain. If the primary returns 429/5xx, retry
 # with the next model in the chain. Only triggers for the /api/generate
 # LLM (not the judge — the judge has its own cross-provider chain).
-# Example: {"MiniMax-M2.7": ["deepseek-chat"]}
+# Example: {"MiniMax-M2.7": ["deepseek-v4-flash"]}
 MODEL_FAILOVER: dict = _cfg.get("model_failover", {})
 
 # New: map of provider_id -> {"base": "...", "key": "..."}
@@ -135,6 +152,10 @@ JUDGE_MIN_SCORE = int(_cfg.get("judge_min_score", 6))
 MESH_REPAIR_ENABLED = bool(_cfg.get("mesh_repair_enabled", True))
 # S4.2: skip VLM judge and retry with watertight hint if STL isn't printable.
 WATERTIGHT_GATE_ENABLED = bool(_cfg.get("watertight_gate_enabled", True))
+# P2 (2026-04-28): pre-judge connected-component gate. If the STL is
+# multiple disconnected pieces (chair legs not touching seat, mug handle
+# floating, car wheels not touching body), retry with a specific hint.
+CONNECTED_GATE_ENABLED = bool(_cfg.get("connected_gate_enabled", True))
 # P3: per-shape routing — override user's model choice when we have
 # benchmark evidence that a different model is materially better for
 # the inferred shape category. Empty / disabled = honor user's choice.
@@ -151,9 +172,32 @@ FEATURE_PRINT_READINESS     = bool(_FF.get("print_readiness", False))
 FEATURE_MULTI_FORMAT_EXPORT = bool(_FF.get("multi_format_export", False))
 FEATURE_SANDBOX_STRICT      = bool(_FF.get("sandbox_strict", False))
 FEATURE_BEST_OF_N           = bool(_FF.get("best_of_n", False))
+FEATURE_PLAN_VALIDATOR      = bool(_FF.get("plan_validator", True))  # P1, default-on
+# P7 (2026-04-29): deterministic AST/bbox gate that catches sub-parts buried
+# inside the root volume (e.g. chessboard squares at Z=0..2 inside base 0..8
+# — union has no visible effect, render is featureless slab). Pure code
+# check, no STL needed. Default-on; flip off if false-positive rate > 0.
+FEATURE_RAISED_PART_GATE    = bool(_FF.get("raised_part_gate", True))
 FEATURE_SLICER_CHECK        = bool(_FF.get("slicer_check", False))
 FEATURE_RENDER_PYVISTA      = bool(_FF.get("render_pyvista", False))
 FEATURE_REFINE_DIFF_PATCH   = bool(_FF.get("refine_diff_patch", True))
+# P3.1 (2026-04-29): image-grounded self-correction. When enabled, every
+# /api/generate call generates a Flux-schnell reference image from the
+# prompt; each candidate STL's iso view is silhouette-IoU compared to it.
+# Default OFF — flip on for survey runs once we've validated end-to-end.
+FEATURE_IMAGE_GROUNDED      = bool(_FF.get("image_grounded_mode", False))
+# P3.2 (2026-04-29): vision critic — when enabled AND image_grounded_mode
+# is on, after a judge-fail the critic compares reference vs candidate iso
+# and produces structured complaints prepended to the retry message.
+# Has no effect if image_grounded_mode is off (no reference exists).
+FEATURE_IMAGE_CRITIC        = bool(_FF.get("image_critic_mode", False))
+# P3.2 catastrophe gate: silhouette IoU below this threshold overrides
+# the judge's pass — forces retry with a "silhouette mismatch" message.
+# Survey data: min pass-IoU=0.138, max fail-IoU=0.014, so 0.10 cleanly
+# separates the two without false-positive risk on realistic outputs.
+IOU_CATASTROPHE_THRESHOLD: float = float(
+    _cfg.get("iou_catastrophe_threshold", 0.10)
+)
 SLICER_PATH: str            = _cfg.get("slicer_path", "")
 BEST_OF_PER_CATEGORY: dict  = _cfg.get("best_of_per_category", {})
 
@@ -318,13 +362,25 @@ def _record_llm_usage(model: str, usage: dict | None) -> None:
     TOKEN_MONITOR.record(model, usage)
 
 
+_PLAN_TRAILING_REMINDER = (
+    "\n\nFINAL REMINDER (overrides any example above that doesn't follow this):\n"
+    "Your output MUST start with a `# PLAN: {...}` JSON comment as specified in "
+    "the PLAN-THEN-CODE PROTOCOL section, then build each named part as a "
+    "separate variable, then assemble. Examples above may pre-date this "
+    "protocol — follow the protocol, not the examples' format.\n"
+    "If the object is a CONTAINER (planter / vase / cup / mug / bowl / box), "
+    "your plan MUST include at least one part with role=\"cut\" representing "
+    "the interior cavity. A planter with no cavity is a solid block, not a planter.\n"
+)
+
+
 def _build_system_prompt_for(prompt: str) -> str:
     """SYSTEM_PROMPT optionally appended with retrieval-augmented few-shots."""
     if not PATTERN_CACHE_ENABLED:
-        return SYSTEM_PROMPT
+        return SYSTEM_PROMPT + _PLAN_TRAILING_REMINDER
     examples = PATTERN_CACHE.examples_for(prompt)
     if not examples:
-        return SYSTEM_PROMPT
+        return SYSTEM_PROMPT + _PLAN_TRAILING_REMINDER
     # S4.6: log injections so we can eventually answer
     # 'did pattern cache actually help first-attempt score?'
     try:
@@ -337,7 +393,7 @@ def _build_system_prompt_for(prompt: str) -> str:
         )
     except Exception:
         pass
-    return SYSTEM_PROMPT + format_examples_block(examples)
+    return SYSTEM_PROMPT + format_examples_block(examples) + _PLAN_TRAILING_REMINDER
 
 # Legacy inline prompts (superseded by prompts/*.md via backend). Retained as
 # a safety fallback in case prompt files are missing at deploy time.
@@ -618,19 +674,44 @@ VISION_MODEL = "qwen2.5vl:7b"
 
 async def analyze_image_with_vision(image_b64: str, object_name: str) -> str:
     """Use vision model to describe the structural features of an object from an image."""
+    # P3.4 (2026-04-29): on deployments without a local Ollama (e.g. mac
+    # mini production) OLLAMA_URL is intentionally empty to disable the
+    # tunnel/local-ollama path. The cloud vision judge (run later, after
+    # STL is built) still works without this stage; the search-time vision
+    # stage just contributes extra image-derived hints. Skip cleanly with a
+    # debug-level log instead of spamming `Vision analysis failed: Request
+    # URL is missing 'http://' or 'https://' protocol` for every search.
+    if not OLLAMA_URL:
+        log.debug("analyze_image_with_vision skipped: OLLAMA_URL not configured")
+        return ""
     try:
+        # P7 (2026-04-28): tightened to demand RATIOS + ATTACHMENT POINTS +
+        # ORIENTATION explicitly. The previous free-form "describe parts"
+        # answer left the code-gen LLM guessing at proportions and how parts
+        # connect, which produced floating legs / mis-oriented hammers.
         prompt = (
-            f"This is an image of a {object_name}. "
-            "Describe ONLY the basic geometric shape for simple 3D printing: "
-            "What are the 2-4 main structural parts? What primitive shapes are they (box, cylinder, cone)? "
-            "IGNORE all surface details, patterns, textures, holes, decorations, color and material. "
-            "Focus ONLY on overall silhouette. Reply in under 80 words."
+            f"This is an image of a {object_name}. Output a STRICT structural "
+            "breakdown for 3D-printing the silhouette only. Follow this template "
+            "exactly — one short line each, no prose.\n"
+            "\n"
+            "ORIENTATION: which axis is length / vertical / depth (use +X/-X/+Z/-Z/+Y/-Y).\n"
+            "PARTS (2-5): for each part, write one line in this form:\n"
+            "  <name> | primitive(box|cylinder|cone|sphere|sweep|loft|revolve) | "
+            "size ratio relative to the LONGEST dimension (e.g. 0.4 x 0.2 x 1.0)\n"
+            "ATTACHMENT: for each non-root part, write `<part> -> <parent> at <position>` "
+            "(e.g. `legs -> body at -Z face, four corners`).\n"
+            "\n"
+            "RULES:\n"
+            "- Ignore color, texture, decoration, fine details.\n"
+            "- Use real-world proportions (a dog's leg is ~0.4x body height, not 1x).\n"
+            "- Every part MUST have an attachment line so the model is connected.\n"
+            "- Reply in under 120 words. NO extra commentary."
         )
         payload = {
             "model": VISION_MODEL,
             "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
             "stream": False,
-            "options": {"num_predict": 200, "temperature": 0.3},
+            "options": {"num_predict": 300, "temperature": 0.3},
             "keep_alive": "5m",
         }
         async with httpx.AsyncClient(timeout=120) as client:
@@ -749,6 +830,17 @@ class GenerateResponse(BaseModel):
     thumbnails: list[str] = []  # URLs to rendered view PNGs
     judge: dict | None = None    # VLM judge result, if enabled
     attempts: int = 1
+    # P3.1 (2026-04-29): image-grounded mode. `reference_url` is the
+    # Flux-schnell reference image for the prompt (UI overlays it next
+    # to the rendered STL). `silhouette_iou` is the normalized binary
+    # IoU between rendered iso view and reference. Both None when the
+    # feature flag is off or the reference call failed.
+    reference_url: str | None = None
+    silhouette_iou: float | None = None
+    # P3.2 (2026-04-29): vision critic verdict from the FINAL retry round.
+    # Only populated when image_critic_mode is on and the critic actually
+    # ran (judge-fail path or IoU-catastrophe path). None otherwise.
+    critic: dict | None = None
     # Sprint 5-7 additions
     cache_hit: bool = False                  # S5.1
     formats: dict = {}                       # S5.2 — {format: download_url}
@@ -756,6 +848,11 @@ class GenerateResponse(BaseModel):
     print_warnings: list[dict] = []          # S6.2 — print-readiness chips
     slicer: dict | None = None               # S6.3 — slicer probe result
     best_of_n_count: int = 1                 # S7.1 — N candidates run
+    # P6 (2026-04-28): retry-exhaustion path returns 200 with success=False
+    # instead of HTTPException(500). Old behavior masked the last-attempt code
+    # and made it impossible for the UI to surface a useful error.
+    success: bool = True
+    last_error: str = ""
 
 
 # HTTP statuses that trigger failover to the next model in the chain
@@ -767,6 +864,19 @@ _failover_stats: dict = {
     "total_calls": 0,   # every call to call_cloud_llm
     "failovers":   0,   # completed by a non-primary model
     "errors":      0,   # all chain members failed
+    "last_reset_ts": int(time.time()),
+}
+
+# P3.2: critic + catastrophe accounting so /api/stats shows mechanism
+# health without grepping the log. Reset on process start.
+_critic_stats: dict = {
+    "calls_started": 0,         # every entry into the critic block
+    "verdicts_returned": 0,     # successful structured verdicts (any quality)
+    "call_errors": 0,           # exceptions inside the critic call
+    "verdict_distribution": {   # match_quality counts
+        "good": 0, "partial": 0, "poor": 0,
+    },
+    "catastrophe_firings": 0,   # IoU < threshold gates fired
     "last_reset_ts": int(time.time()),
 }
 
@@ -784,7 +894,13 @@ async def _call_one_cloud(client: httpx.AsyncClient, messages: list[dict],
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": 4096,
+        # 2026-05-12: bumped 4096 → 16384. MiniMax-M2.7 + deepseek-v4-flash
+        # default to thinking ON; 4096 was consumed entirely by <think>...
+        # reasoning, truncating BEFORE the actual code block. Mug/shoe 6/6
+        # exec_failed in the V4 baseline (mean 6.52 vs patch7-8 8.38) was
+        # traced to "J0A1: empty code" — raw response was 17K chars of pure
+        # <think> with the python fence just barely starting before truncation.
+        "max_tokens": 16384,
         "temperature": 0.3,
     }
     provider_id = MODEL_PROVIDER.get(model, "(default)")
@@ -851,6 +967,17 @@ async def call_ollama(messages: list[dict], model: str | None = None) -> str:
     model = model or OLLAMA_MODEL
     if is_cloud_model(model):
         return await call_cloud_llm(messages, model)
+    # P3.4 (2026-04-29): if OLLAMA_URL is empty (deployment without local
+    # Ollama, e.g. mac mini production), surface a clear error instead of
+    # the cryptic "Request URL is missing an 'http://' or 'https://' protocol".
+    if not OLLAMA_URL:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Model '{model}' is not a cloud model and OLLAMA_URL "
+                   "is not configured. Either pick a cloud model "
+                   "(MiniMax-M2.7, deepseek-v4-flash, gemini-*) or set "
+                   "ollama_url + ollama_model in config.json to point at "
+                   "a reachable Ollama instance.")
     payload = {
         "model": model,
         "messages": messages,
@@ -1143,6 +1270,65 @@ def _cadquery_fix_hint(err: str) -> str:
     return ""
 
 
+def _error_signature(err: str) -> str:
+    """Produce a coarse fingerprint of an error for repeat-detection.
+
+    Two attempts whose errors map to the same signature are considered
+    "the same kind of error" — even if line numbers or specific
+    identifiers differ. Used by the codegen retry loop to detect when
+    the LLM is repeating itself and escalate the retry message.
+
+    P3.6 (2026-04-29): added so the retry feedback loop can flag
+    repeats explicitly. Survey of failed bench runs showed ~5/7
+    stochastic exec failures were the LLM repeating the same
+    fillet-after-boolean / invented-selector mistake across all 3
+    retries despite a fix-hint message. The plain hint reads as
+    "here's how to fix it" — by the second occurrence the LLM needs
+    "you JUST did this; do something different".
+    """
+    e = (err or "").lower()
+    # CadQuery / OCC error fingerprints
+    if "brep_api: command not done" in e:
+        return "brep_command_not_done"
+    if "brepoffsetapi_makepipeshell" in e:
+        return "sweep_pipe_failed"
+    if "no suitable edges" in e or "fillets requires" in e:
+        return "fillet_no_edges"
+    if "%circle" in e or "%plane" in e or "%line" in e:
+        return "invented_selector"
+    if "ncollection_sequence" in e or "bnd_box" in e:
+        return "geom_collection_failed"
+    if "loft" in e or "makelolift" in e or "brepfill" in e:
+        return "loft_failed"
+    if "could not find valid" in e and "plane" in e:
+        return "broken_workplane"
+    # Validator-emitted pitfall messages
+    if "fillet" in e and ("after" in e or "boolean" in e or "union" in e):
+        return "fillet_after_boolean"
+    if "moveto" in e and ("3d" in e or " z" in e or "z=" in e):
+        return "3d_moveto"
+    if "revolve" in e and ("profile" in e or "axis" in e or "hollow" in e):
+        return "revolve_profile"
+    # Python-level
+    if "syntaxerror" in e or "syntax error" in e:
+        return "syntax_error"
+    if "nameerror" in e or ("name '" in e and "is not defined" in e):
+        return "undefined_name"
+    if "typeerror" in e:
+        return "type_error"
+    if "attributeerror" in e:
+        return "attribute_error"
+    if "importerror" in e or "modulenotfounderror" in e:
+        return "import_error"
+    # Pipeline-generic
+    if "empty" in e and "code" in e:
+        return "empty_code"
+    if "no stl" in e or "stl was not exported" in e or "did not export" in e:
+        return "no_stl_export"
+    # Fallback: first 60 chars normalized
+    return e[:60]
+
+
 # Keywords that indicate the user asked for a container-with-handle.
 _MUG_KEYWORDS = (
     "mug", "cup", "coffee", "tea", "teapot", "pitcher",
@@ -1308,6 +1494,56 @@ def _check_watertight(stl_path: Path) -> bool:
         return False
 
 
+# P2 (2026-04-28): connected-component count.
+def _count_components(stl_path: Path) -> int:
+    """Return the number of disconnected mesh components in the STL.
+
+    Uses face-adjacency split. A correctly unioned model is 1.
+    >1 means the LLM produced parts that don't actually touch
+    (e.g. chair legs in air below seat, cup handle separate from body).
+    Returns 0 on any load/parse failure (caller should treat 0 as "skip
+    the gate" — we don't want a flaky load to block all retries).
+    """
+    try:
+        import trimesh
+        m = trimesh.load_mesh(str(stl_path))
+        if not hasattr(m, "split") and hasattr(m, "geometry"):
+            try:
+                m = trimesh.util.concatenate(tuple(m.geometry.values()))
+            except Exception:
+                return 0
+        # Face-adjacency split: counts pieces that don't share an edge.
+        # `only_watertight=False` because we run BEFORE the watertight
+        # gate, so pieces may not yet be watertight.
+        parts = m.split(only_watertight=False)
+        return len(parts) if parts else 1
+    except Exception:
+        return 0
+
+
+def _connected_retry_hint(prompt: str, n_parts: int) -> str:
+    """Tell the LLM the previous output was N disconnected pieces, with
+    category-specific advice on what should overlap with what."""
+    return (
+        f"\n\nThe produced STL is {n_parts} DISCONNECTED PIECES. "
+        f"Every part you create must SHARE VOLUME with at least one "
+        f"neighbour, or the model is not a single object — it's a "
+        f"disassembled pile.\n"
+        f"Common mistakes that cause this:\n"
+        f"- Legs/wheels positioned BELOW or to the SIDE of the body "
+        f"with no overlap. Move them up/in so they intersect the body "
+        f"by at least 5mm before union.\n"
+        f"- Handle endpoints landing in empty space rather than on the "
+        f"body wall. The handle's start and end points must be INSIDE "
+        f"the body's outer surface.\n"
+        f"- Sub-parts unioned with `.union()` but actually positioned "
+        f"in different coordinate systems. Verify positions are in the "
+        f"SAME workplane / same axis convention.\n"
+        f"Regenerate the code so the FINAL `result` is one connected "
+        f"piece. Output ONLY corrected Python code."
+    )
+
+
 def _watertight_retry_hint(prompt: str) -> str:
     """Directive telling the LLM to regenerate for a printable mesh."""
     return (
@@ -1330,6 +1566,42 @@ def _watertight_retry_hint(prompt: str) -> str:
     )
 
 
+def _build_vision_specs() -> list[dict]:
+    """Build the vision tier-fallback chain used by the judge AND the
+    P3.2 critic.
+
+    S1.2 logic — priority:
+        1. explicit `cloud_vision_models` list from config
+        2. legacy single `cloud_vision_model`
+        3. same-provider siblings of the primary (e.g. other flash variants)
+
+    Each entry is `{model, api_base, api_key}`. Entries with no resolvable
+    key are dropped. Return order is the order they'll be tried in.
+    """
+    chain: list[str] = []
+    for m in CLOUD_VISION_MODELS:
+        if m and m not in chain:
+            chain.append(m)
+    if CLOUD_VISION_MODEL and CLOUD_VISION_MODEL not in chain:
+        chain.append(CLOUD_VISION_MODEL)
+    if CLOUD_VISION_MODEL:
+        primary_pid = MODEL_PROVIDER.get(CLOUD_VISION_MODEL)
+        for m in MODEL_PROVIDER:
+            if (MODEL_PROVIDER.get(m) == primary_pid
+                    and m != CLOUD_VISION_MODEL
+                    and "flash" in m.lower()
+                    and m not in chain):
+                chain.append(m)
+
+    specs: list[dict] = []
+    for m in chain:
+        base, key = _resolve_provider(m)
+        if not key:
+            continue
+        specs.append({"model": m, "api_base": base, "api_key": key})
+    return specs
+
+
 async def _render_and_judge(
     job_id: str,
     stl_path: Path,
@@ -1349,37 +1621,9 @@ async def _render_and_judge(
         return [], None
     thumbnail_urls = [f"/api/thumbnail/{job_id}/{p.name}" for p in pngs]
 
-    # S1.2 — build cross-provider vision spec chain.
-    # Priority: explicit `cloud_vision_models` list → legacy single model
-    # → per-provider siblings of the primary (Gemini-flash family).
-    chain: list[str] = []
-    for m in CLOUD_VISION_MODELS:
-        if m and m not in chain:
-            chain.append(m)
-    if CLOUD_VISION_MODEL and CLOUD_VISION_MODEL not in chain:
-        chain.append(CLOUD_VISION_MODEL)
-    # Same-provider siblings (e.g. other flash variants) as last-resort
-    if CLOUD_VISION_MODEL:
-        primary_pid = MODEL_PROVIDER.get(CLOUD_VISION_MODEL)
-        for m in MODEL_PROVIDER:
-            if (MODEL_PROVIDER.get(m) == primary_pid
-                    and m != CLOUD_VISION_MODEL
-                    and "flash" in m.lower()
-                    and m not in chain):
-                chain.append(m)
-
-    if not chain:
-        log.warning(f"[{job_id}] No vision model configured; skipping judge")
-        return thumbnail_urls, None
-
-    vision_specs: list[dict] = []
-    for m in chain:
-        base, key = _resolve_provider(m)
-        if not key:
-            continue
-        vision_specs.append({"model": m, "api_base": base, "api_key": key})
+    vision_specs = _build_vision_specs()
     if not vision_specs:
-        log.warning(f"[{job_id}] No API key for any vision model in {chain!r}; skipping judge")
+        log.warning(f"[{job_id}] No vision model configured; skipping judge")
         return thumbnail_urls, None
 
     log.info(f"[{job_id}] Vision judge chain: {[s['model'] for s in vision_specs]}")
@@ -1489,6 +1733,51 @@ def _run_geom_check(stl_path: Path, prompt: str) -> "object | None":
         return geom_check(stl_path, cat)
     except Exception as e:
         log.debug(f"geom_check skipped: {e}")
+        return None
+
+
+def _run_plan_check(stl_path: Path, code: str) -> "object | None":
+    """P1 (2026-04-28): plan-vs-output reconciliation.
+
+    General check (no per-category logic): the LLM emits `# PLAN: {...}`
+    declaring parts and sizes. We measure the STL bbox and component
+    count, compare to PLAN expectations, and flag silent OCC failures
+    (boolean drop, parts disconnected). Returns None if no PLAN found
+    or feature flag is off."""
+    if not FEATURE_PLAN_VALIDATOR:
+        return None
+    try:
+        from plan_validator import check as plan_check
+        return plan_check(stl_path, code)
+    except Exception as e:
+        log.debug(f"plan_validator skipped: {e}")
+        return None
+
+
+def _run_raised_part_check(code: str) -> "object | None":
+    """P7 (2026-04-29): AST/bbox gate that catches sub-parts buried inside
+    the root volume.
+
+    Pure code analysis — does not need the STL. Catches the chessboard
+    failure mode where the LLM writes
+        sq = cq.Workplane("XY").center(x, y).box(50, 50, 2, ...)
+    forgetting `.workplane(offset=8)` so the squares end up at Z=0..2
+    fully inside the Z=0..8 base. The union has no visible effect, the
+    VLM judge often hallucinates the missing pattern, and we waste a
+    full retry round. This gate fails the code BEFORE the VLM sees it.
+
+    Returns None if feature flag is off OR if no buried-part issue was
+    detected (ie. RaisedPartResult with passed=True is treated as None
+    so the call site can use the same `if result is not None and not
+    result.passed` idiom as plan_check / geom_check)."""
+    if not FEATURE_RAISED_PART_GATE:
+        return None
+    try:
+        from raised_part_gate import check as raised_check
+        result = raised_check(code)
+        return result if not result.passed else None
+    except Exception as e:
+        log.debug(f"raised_part_gate skipped: {e}")
         return None
 
 
@@ -1770,6 +2059,19 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
         ]
         enriched = await call_ollama(enrich_messages, req.model)
         enriched = enriched.strip()
+        # Strip reasoning leak — Qwen-style models occasionally emit a
+        # `<think>...</think>` block (or a partial open tag with no close)
+        # in the enrichment output. Without this strip, the codegen LLM
+        # gets garbage input and hallucinates wildly.
+        if "</think>" in enriched:
+            enriched = enriched.split("</think>")[-1].strip()
+        enriched = re.sub(r"<think>.*?</think>", "", enriched, flags=re.DOTALL).strip()
+        if enriched.startswith("<think>"):
+            # Unclosed think block — discard the entire enrichment and
+            # fall back to the raw user prompt to avoid feeding garbage.
+            log.warning(f"[{job_id}] Enrichment produced unclosed <think>; "
+                        f"falling back to raw prompt")
+            enriched = req.prompt
         await events.emit("progress", stage="enrich", status="done",
                           enriched_prompt=enriched[:300])
         log.info(f"[{job_id}] Enriched: {enriched[:200]}")
@@ -1777,6 +2079,57 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
         enrich_dir = OUTPUT_DIR / job_id
         enrich_dir.mkdir(exist_ok=True)
         (enrich_dir / "enriched_prompt.txt").write_text(enriched, encoding="utf-8")
+
+        # P3.1 (2026-04-29): image-grounded mode — generate Flux reference
+        # ONCE per request, before any code-gen rounds. We use the
+        # English category from pattern_cache.infer_category as the Flux
+        # description: Flux's CLIP encoder is English-biased, so a
+        # raw Chinese prompt like "一張椅子" produces nonsense (verified
+        # in P3.1 smoke test #1). The category mapping is already
+        # general-purpose (covers chair / vase / dog / car / 16 more),
+        # has zero per-shape parameters, and falls back to raw prompt
+        # for unknowns. Cached by SHA256(description) so repeats are free.
+        reference_path: Path | None = None
+        reference_url_value: str | None = None
+        if FEATURE_IMAGE_GROUNDED:
+            await events.emit("progress", stage="reference_image", status="start")
+            try:
+                from pattern_cache import infer_category
+                _cat = infer_category(req.prompt)
+            except Exception:
+                _cat = "misc"
+            # If the prompt is already mostly ASCII (English), use it as-is;
+            # otherwise prefer the category label. Falls back to the raw
+            # prompt only when no category match — at least Flux gets to
+            # try.
+            _is_english = all(ord(c) < 128 for c in req.prompt)
+            if _is_english:
+                flux_desc = req.prompt
+            elif _cat != "misc":
+                flux_desc = _cat.replace("_", " ")  # "phone_stand" -> "phone stand"
+            else:
+                flux_desc = req.prompt
+            log.info(f"[{job_id}] flux description = {flux_desc!r} "
+                     f"(category={_cat}, is_english={_is_english})")
+            try:
+                reference_path = await asyncio.to_thread(
+                    generate_reference_image,
+                    flux_desc,
+                    enrich_dir,           # writes reference_iso.png here
+                    "iso",
+                    OUTPUT_DIR / "_image_cache",
+                )
+            except Exception as e:
+                log.warning(f"[{job_id}] reference image gen errored: {e}")
+                reference_path = None
+            if reference_path is not None:
+                reference_url_value = f"/api/thumbnail/{job_id}/{reference_path.name}"
+                log.info(f"[{job_id}] reference image ready: {reference_path.name}")
+                await events.emit("progress", stage="reference_image",
+                                  status="done", url=reference_url_value)
+            else:
+                await events.emit("progress", stage="reference_image",
+                                  status="skipped")
 
         # Step 2: Generate code from enriched prompt
         # S3.1: inject retrieval-augmented few-shot examples if we have
@@ -1789,35 +2142,117 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
         last_error = None
         code = ""
         best_response: GenerateResponse | None = None  # remembered across judge retries
+        # P3.2: latest critic dict survives across rounds. Without this,
+        # when the FINAL round passes judge (e.g. chair: round 2 fails →
+        # critic fires → round 3 passes), the returned response is fresh
+        # and the previously-collected critic verdict is lost.
+        last_critic_dict: dict | None = None
         total_attempts = 1 + MAX_RETRIES  # exec-fix attempts per generation
         judge_rounds = JUDGE_MAX_RETRIES if JUDGE_ENABLED else 0
+        # P3.3: connected_gate / watertight / plan_check / geom_check
+        # used to share the judge_rounds budget — meaning two consecutive
+        # connected_gate failures could exhaust retries before the judge
+        # ever ran (and before the critic / catastrophe gate ever had a
+        # chance to fire). Now pre-judge gates use a SEPARATE budget
+        # (gate_skips up to MAX_GATE_SKIPS). Total iterations bounded by
+        # `judge_rounds + 1 + MAX_GATE_SKIPS` so we never run forever.
+        MAX_GATE_SKIPS = JUDGE_MAX_RETRIES if JUDGE_ENABLED else 0
+        gate_skips = 0
 
         stl_ready_emitted = False
+        # P3.4 (2026-04-29): when the active LLM returns empty code twice
+        # in a row, swap to the first entry of MODEL_FAILOVER for the rest
+        # of this generate. The previous behavior wasted the entire retry
+        # budget on the same model that just demonstrated it cannot follow
+        # the output contract. Tracked across attempts and judge rounds.
+        active_model = req.model
+        empty_streak = 0
+        switched_due_to_empty = False
+
         # Outer loop: visual-judge rounds (incl. round 0)
-        for judge_round in range(judge_rounds + 1):
+        judge_round = 0
+        while judge_round < (judge_rounds + 1 + gate_skips):
             # Inner loop: exec-fix attempts (regen on exec/validation error)
             inner_success = False
+            # P3.6 (2026-04-29): track previous attempt's error fingerprint
+            # so the retry message can FLAG repeats explicitly. The plain
+            # fix-hint reads as "here's how to fix it" — by the second
+            # occurrence the LLM needs "you JUST did this; do something
+            # categorically different".
+            prev_error_sig: str | None = None
             for attempt in range(total_attempts):
                 await events.emit("progress", stage="codegen", status="start",
                                   judge_round=judge_round + 1, attempt=attempt + 1)
-                raw_code = await call_ollama(messages, req.model)
+                raw_code = await call_ollama(messages, active_model)
                 raw_path = OUTPUT_DIR / job_id / f"raw_judge{judge_round}_attempt{attempt+1}.txt"
                 raw_path.parent.mkdir(exist_ok=True)
                 raw_path.write_text(raw_code, encoding="utf-8")
                 code = clean_code(raw_code)
                 if not code.strip():
-                    log.warning(f"[{job_id}] J{judge_round}A{attempt+1}: empty code")
+                    empty_streak += 1
+                    log.warning(f"[{job_id}] J{judge_round}A{attempt+1}: empty code "
+                                f"(streak={empty_streak}, model={active_model or OLLAMA_MODEL})")
+                    # P3.4: failover after 2 consecutive empties from the same model
+                    if (empty_streak >= 2 and not switched_due_to_empty):
+                        primary = active_model or OLLAMA_MODEL
+                        chain = MODEL_FAILOVER.get(primary, [])
+                        if chain:
+                            active_model = chain[0]
+                            switched_due_to_empty = True
+                            empty_streak = 0
+                            log.warning(f"[{job_id}] empty-code failover: "
+                                        f"{primary} -> {active_model}")
+                    # P3.6: track empty-code as its own error class for repeat
+                    # detection. If the LLM returns empty twice the failover
+                    # already swaps models, but if the next model also goes
+                    # empty we want the message to escalate.
+                    cur_sig = "empty_code"
+                    is_repeat = (prev_error_sig == cur_sig)
+                    empty_msg = "Your response did not contain valid Python code. Please output ONLY a Python script."
+                    if is_repeat:
+                        empty_msg = (
+                            "REPEAT ERROR — your previous response was also "
+                            "empty / non-code. Output ONLY raw Python code "
+                            "starting with `import cadquery as cq`. No "
+                            "<think> tags, no markdown, no commentary."
+                        )
+                        log.warning(f"[{job_id}] J{judge_round}A{attempt+1} REPEAT (empty_code)")
                     messages.append({"role": "assistant", "content": raw_code})
-                    messages.append({"role": "user", "content": "Your response did not contain valid Python code. Please output ONLY a Python script."})
+                    messages.append({"role": "user", "content": empty_msg})
+                    prev_error_sig = cur_sig
                     continue
+                # Non-empty response — clear streak (but NOT prev_error_sig:
+                # success at codegen != success at validator/exec, and we
+                # still want repeat-detection across mixed error types).
+                empty_streak = 0
 
                 vres = _validate_for_backend(code)
                 if vres is not None and not vres.ok:
                     log.warning(f"[{job_id}] J{judge_round}A{attempt+1} AST fail: {vres.errors[:3]}")
                     last_error = "; ".join(vres.errors[:5])
-                    if attempt < total_attempts - 1:
-                        messages.append({"role": "assistant", "content": code})
-                        messages.append({"role": "user", "content": format_errors_for_llm(vres.errors)})
+                    # P3.6: classify error and detect repeats
+                    cur_sig = _error_signature(last_error)
+                    is_repeat = (prev_error_sig is not None and cur_sig == prev_error_sig)
+                    # P3.6: ALWAYS append assistant+user turns (was: only when
+                    # attempt < total_attempts - 1). The dropped final-attempt
+                    # message could leave the messages history out of sync with
+                    # what the model actually produced — and on judge-triggered
+                    # retries downstream the model would lose context of its
+                    # last failure.
+                    messages.append({"role": "assistant", "content": code})
+                    fb = format_errors_for_llm(vres.errors)
+                    if is_repeat:
+                        fb = (
+                            f"REPEAT ERROR — you produced the SAME class of "
+                            f"failure ({cur_sig}) in your previous attempt. "
+                            f"The previous fix instruction did not work. Try "
+                            f"a CATEGORICALLY DIFFERENT approach (different "
+                            f"primitives, simpler geometry, fewer features) "
+                            f"rather than tweaking the same code.\n\n" + fb
+                        )
+                        log.warning(f"[{job_id}] J{judge_round}A{attempt+1} REPEAT ({cur_sig})")
+                    messages.append({"role": "user", "content": fb})
+                    prev_error_sig = cur_sig
                     continue
 
                 try:
@@ -1834,22 +2269,74 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
                                       detail=str(last_error)[:200])
                     log.warning(f"[{job_id}] J{judge_round}A{attempt+1} exec fail: {last_error}")
                     log.warning(f"[{job_id}] Failed code (first 600 chars):\n{code[:600]}")
-                    if attempt < total_attempts - 1:
-                        messages.append({"role": "assistant", "content": code})
-                        fix_hint = _cadquery_fix_hint(last_error) if BACKEND == "cadquery" \
-                                   else _trimesh_fix_hint(last_error)
-                        # On the last retry before we bail, paste a minimal
-                        # known-good template if the prompt is mug-shaped.
-                        if BACKEND == "cadquery" and attempt == total_attempts - 2:
-                            fix_hint += _final_retry_fallback(req.prompt)
-                        messages.append({"role": "user", "content": f"The code failed with:\n{last_error}\nFix the code. Output ONLY valid Python code.{fix_hint}"})
+                    # P3.6: classify error and detect repeats
+                    cur_sig = _error_signature(str(last_error))
+                    is_repeat = (prev_error_sig is not None and cur_sig == prev_error_sig)
+                    # P3.6: ALWAYS append (was: only when attempt < total-1).
+                    # Same reasoning as the validator branch above.
+                    messages.append({"role": "assistant", "content": code})
+                    fix_hint = _cadquery_fix_hint(str(last_error)) if BACKEND == "cadquery" \
+                               else _trimesh_fix_hint(str(last_error))
+                    # On the last retry before we bail, paste a minimal
+                    # known-good template if the prompt is mug-shaped.
+                    if BACKEND == "cadquery" and attempt == total_attempts - 2:
+                        fix_hint += _final_retry_fallback(req.prompt)
+                    retry_msg = (
+                        f"The code failed with:\n{last_error}\n"
+                        f"Fix the code. Output ONLY valid Python code.{fix_hint}"
+                    )
+                    if is_repeat:
+                        retry_msg = (
+                            f"REPEAT ERROR — you produced the SAME class of "
+                            f"failure ({cur_sig}) in your previous attempt. "
+                            f"The previous fix instruction did not work. Try "
+                            f"a CATEGORICALLY DIFFERENT approach (different "
+                            f"primitives, simpler geometry, fewer features) "
+                            f"rather than tweaking the same code.\n\n" + retry_msg
+                        )
+                        log.warning(f"[{job_id}] J{judge_round}A{attempt+1} REPEAT ({cur_sig})")
+                    messages.append({"role": "user", "content": retry_msg})
+                    prev_error_sig = cur_sig
 
             if not inner_success:
-                # Couldn't produce executable code even after MAX_RETRIES; bail
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed after {total_attempts} attempts in judge round {judge_round}. Last error: {last_error or 'empty code'}",
+                # P6 (2026-04-28): retry-exhausted at exec stage. Don't 500;
+                # return a structured failure carrying the last code + error
+                # so the UI can show "LLM kept failing — here's what it tried"
+                # and the user can re-run or refine. Old behavior raised
+                # HTTPException(500) and the SSE/blocking endpoints both
+                # surfaced as opaque server errors.
+                err_msg = last_error or "empty code"
+                log.warning(
+                    f"[{job_id}] Retry exhausted at J{judge_round+1}: {err_msg}"
                 )
+                exhausted = GenerateResponse(
+                    id=job_id,
+                    code=code,
+                    stl_url="",
+                    enriched_prompt=enriched,
+                    search_info=search_info,
+                    thumbnails=[],
+                    judge={
+                        "category": "exec_failed",
+                        "match_score": 1,
+                        "geometry_issues": [
+                            f"All {total_attempts} attempts failed at exec/validation",
+                            str(err_msg)[:300],
+                        ],
+                        "fix_suggestion": (
+                            "The LLM emitted code that fails CadQuery's "
+                            "type checks repeatedly. Try a simpler prompt "
+                            "or rephrase."
+                        ),
+                    },
+                    attempts=judge_round * total_attempts + total_attempts,
+                    success=False,
+                    last_error=str(err_msg)[:500],
+                )
+                _finalize_generate(req, job_id, exhausted, code,
+                                   sys_prompt_for_cache, _start_ts,
+                                   exec_ok=False, store_cache=False)
+                return exhausted
 
             # We have an executable STL.
             stl_path = OUTPUT_DIR / job_id / "model.stl"
@@ -1867,16 +2354,62 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
                                   search_info=search_info)
                 stl_ready_emitted = True
 
+            # P2 (2026-04-28): pre-judge connected-component gate.
+            # Runs BEFORE watertight gate because a multi-piece STL is
+            # by definition not watertight, but "N disconnected pieces"
+            # is a more actionable retry hint than "not watertight".
+            # 0 means load failed → skip the gate (don't block retries
+            # on a flaky trimesh load).
+            if CONNECTED_GATE_ENABLED and gate_skips < MAX_GATE_SKIPS:
+                n_parts = _count_components(stl_path)
+                if n_parts > 1:
+                    log.warning(
+                        f"[{job_id}] J{judge_round+1} STL is {n_parts} "
+                        f"disconnected pieces; skipping judge, retrying "
+                        f"with attachment hint (gate_skip {gate_skips+1}/{MAX_GATE_SKIPS})"
+                    )
+                    best_response = GenerateResponse(
+                        id=job_id,
+                        code=code,
+                        stl_url=f"/api/download/{job_id}",
+                        enriched_prompt=enriched,
+                        search_info=search_info,
+                        thumbnails=[],
+                        judge={
+                            "category": "disconnected_parts",
+                            "match_score": 2,
+                            "geometry_issues": [
+                                f"{n_parts} disconnected pieces — parts "
+                                f"don't share volume (legs/wheels not "
+                                f"touching body, handle not on wall, etc)"
+                            ],
+                            "fix_suggestion": (
+                                "Move sub-parts so they overlap with "
+                                "the body by ≥5mm before .union()"
+                            ),
+                        },
+                        attempts=judge_round + 1,
+                    )
+                    messages.append({"role": "assistant", "content": code})
+                    messages.append({
+                        "role": "user",
+                        "content": _connected_retry_hint(req.prompt, n_parts),
+                    })
+                    gate_skips += 1
+                    judge_round += 1
+                    continue  # next judge round (gate_skip — doesn't consume judge budget)
+
             # S4.2: pre-judge watertight gate. If the STL isn't
             # watertight, skip the (expensive) VLM judge and feed a
             # specific watertight hint into the retry loop. The judge
             # can't see 'hole in the back' reliably anyway; this saves
             # a judge call AND gives the LLM a more actionable fix.
-            if (WATERTIGHT_GATE_ENABLED and judge_round < judge_rounds
+            if (WATERTIGHT_GATE_ENABLED and gate_skips < MAX_GATE_SKIPS
                     and not _check_watertight(stl_path)):
                 log.warning(
                     f"[{job_id}] J{judge_round+1} STL not watertight; "
-                    f"skipping judge, retrying with watertight hint"
+                    f"skipping judge, retrying with watertight hint "
+                    f"(gate_skip {gate_skips+1}/{MAX_GATE_SKIPS})"
                 )
                 best_response = GenerateResponse(
                     id=job_id,
@@ -1903,7 +2436,85 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
                     "role": "user",
                     "content": _watertight_retry_hint(req.prompt),
                 })
-                continue  # next judge round
+                gate_skips += 1
+                judge_round += 1
+                continue  # next judge round (gate_skip — doesn't consume judge budget)
+
+            # P1 (2026-04-28): plan-vs-output reconciliation gate.
+            # Runs BEFORE geom_check + VLM judge. General check — uses
+            # only the LLM's own PLAN comment. Catches silent OCC drop
+            # (dog: 13 unions → 8mm STL) and disconnected components
+            # (car: wheels not overlapping body). No category logic.
+            plan_result = _run_plan_check(stl_path, code)
+            if (plan_result is not None and not plan_result.passed
+                    and gate_skips < MAX_GATE_SKIPS):
+                from plan_validator import build_retry_hint as _plan_retry_hint
+                log.warning(
+                    f"[{job_id}] J{judge_round+1} plan_check FAIL: "
+                    f"{plan_result.fail_reason} "
+                    f"(gate_skip {gate_skips+1}/{MAX_GATE_SKIPS})"
+                )
+                best_response = GenerateResponse(
+                    id=job_id,
+                    code=code,
+                    stl_url=f"/api/download/{job_id}",
+                    enriched_prompt=enriched,
+                    search_info=search_info,
+                    thumbnails=[],
+                    judge={
+                        "category": "plan_check_fail",
+                        "match_score": None,
+                        "geometry_issues": list(plan_result.issues),
+                        "fix_suggestion": plan_result.fix_suggestion,
+                    },
+                    attempts=judge_round + 1,
+                )
+                messages.append({"role": "assistant", "content": code})
+                messages.append({"role": "user",
+                                 "content": _plan_retry_hint(plan_result)})
+                gate_skips += 1
+                judge_round += 1
+                continue  # next judge round (gate_skip — doesn't consume judge budget)
+
+            # P7 (2026-04-29): deterministic AST/bbox gate — catches
+            # sub-parts buried inside the root volume (e.g. chessboard
+            # squares written as `.center(x,y).box(50,50,2)` at Z=0..2
+            # inside a Z=0..8 base). Pure code check, runs before the
+            # VLM judge so we don't waste a judge call on a slab whose
+            # pattern is invisible. Same skip-budget as the other gates.
+            raised_result = _run_raised_part_check(code)
+            if (raised_result is not None and not raised_result.passed
+                    and gate_skips < MAX_GATE_SKIPS):
+                from raised_part_gate import build_retry_hint as _raised_hint
+                log.warning(
+                    f"[{job_id}] J{judge_round+1} raised_part_gate FAIL: "
+                    f"{raised_result.fail_reason} "
+                    f"(buried={raised_result.buried_vars}; "
+                    f"gate_skip {gate_skips+1}/{MAX_GATE_SKIPS})"
+                )
+                best_response = GenerateResponse(
+                    id=job_id,
+                    code=code,
+                    stl_url=f"/api/download/{job_id}",
+                    enriched_prompt=enriched,
+                    search_info=search_info,
+                    thumbnails=[],
+                    judge={
+                        "category": "raised_part_gate_fail",
+                        "match_score": None,
+                        "geometry_issues": list(raised_result.issues),
+                        "fix_suggestion": raised_result.fix_suggestion,
+                        "buried_vars": list(raised_result.buried_vars),
+                        "root_var": raised_result.root_var,
+                    },
+                    attempts=judge_round + 1,
+                )
+                messages.append({"role": "assistant", "content": code})
+                messages.append({"role": "user",
+                                 "content": _raised_hint(raised_result)})
+                gate_skips += 1
+                judge_round += 1
+                continue  # next judge round (gate_skip — doesn't consume judge budget)
 
             # S6.1: programmatic geometric gate (zero-token).
             # Runs after watertight gate, before VLM judge — catches
@@ -1911,10 +2522,11 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
             # by feeding the LLM an actionable retry hint.
             geom_result = _run_geom_check(stl_path, req.prompt)
             if (geom_result is not None and not geom_result.passed
-                    and judge_round < judge_rounds):
+                    and gate_skips < MAX_GATE_SKIPS):
                 log.warning(
                     f"[{job_id}] J{judge_round+1} geom_check FAIL: "
-                    f"{geom_result.fail_reason}"
+                    f"{geom_result.fail_reason} "
+                    f"(gate_skip {gate_skips+1}/{MAX_GATE_SKIPS})"
                 )
                 best_response = GenerateResponse(
                     id=job_id,
@@ -1943,13 +2555,43 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
                     f"{geom_result.fix_suggestion} "
                     "Output ONLY corrected Python code."
                 )})
-                continue  # skip VLM, next judge round
+                gate_skips += 1
+                judge_round += 1
+                continue  # skip VLM, next judge round (gate_skip — doesn't consume judge budget)
 
             await events.emit("progress", stage="judge", status="start",
                               judge_round=judge_round + 1)
             thumbs, judge = await _render_and_judge(job_id, stl_path, req.prompt)
             await events.emit("progress", stage="judge", status="done",
                               score=(judge.match_score if judge else None))
+
+            # P3.1: silhouette IoU between rendered iso view and Flux
+            # reference. Pure observational at this stage — we attach the
+            # number to the response but do NOT change retry behavior off
+            # it. P3.1.6 survey will tell us if IoU correlates with judge
+            # score before we let it gate retries.
+            iou_value: float | None = None
+            if FEATURE_IMAGE_GROUNDED and reference_path is not None:
+                cand_iso = OUTPUT_DIR / job_id / "views" / "iso.png"
+                if cand_iso.exists():
+                    try:
+                        iou_value = await asyncio.to_thread(
+                            compute_silhouette_iou, reference_path, cand_iso,
+                        )
+                    except Exception as e:
+                        log.warning(f"[{job_id}] silhouette IoU errored: {e}")
+                        iou_value = None
+                    if iou_value is not None:
+                        log.info(f"[{job_id}] silhouette IoU = {iou_value:.3f} "
+                                 f"(round {judge_round + 1})")
+                        await events.emit("progress", stage="silhouette_iou",
+                                          status="done", iou=iou_value,
+                                          judge_round=judge_round + 1)
+                    else:
+                        log.warning(
+                            f"[{job_id}] silhouette IoU = None "
+                            f"(extraction failed; see silhouette_iou warning)"
+                        )
 
             response = GenerateResponse(
                 id=job_id,
@@ -1971,6 +2613,8 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
                         "method": geom_result.method,
                     } if geom_result is not None else None
                 ),
+                reference_url=reference_url_value,
+                silhouette_iou=iou_value,
             )
 
             # If judging disabled → accept whatever executed.
@@ -2001,8 +2645,51 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
             # judge_round < judge_rounds. Now those degraded results stay out
             # of pattern_cache + output_cache and fall to the best-effort path.
             geom_ok = geom_result is None or geom_result.passed
-            if judge.match_score >= JUDGE_MIN_SCORE and geom_ok:
+
+            # P3.2 catastrophe gate: when image_grounded_mode is on AND we
+            # have an IoU number AND it's below the catastrophe threshold,
+            # force retry regardless of what the judge said. Survey data
+            # showed judge can score 5–10 on a candidate whose silhouette
+            # has near-zero IoU with the reference (visual mismatch the
+            # judge missed). Default threshold 0.10 cleanly separates the
+            # "true visual fail" cases without false-positives.
+            iou_catastrophe = (
+                FEATURE_IMAGE_GROUNDED
+                and iou_value is not None
+                and iou_value < IOU_CATASTROPHE_THRESHOLD
+            )
+            if iou_catastrophe:
+                log.warning(
+                    f"[{job_id}] IoU catastrophe gate fired: "
+                    f"{iou_value:.3f} < {IOU_CATASTROPHE_THRESHOLD} "
+                    f"(judge said {judge.match_score}/10) — forcing retry"
+                )
+                _critic_stats["catastrophe_firings"] += 1
+
+            # P3.5 (2026-04-29): category_match is the new top gate. If the
+            # VLM judged the silhouette as NOT matching the requested object
+            # (e.g. rendered a pyramid for "chessboard"), force retry
+            # regardless of any other check or score. None means undecided
+            # (legacy/parse error/disabled judge) and is treated as pass.
+            category_mismatch = (
+                getattr(judge, "category_match", None) is False
+            )
+            if category_mismatch:
+                log.warning(
+                    f"[{job_id}] Judge category-mismatch: "
+                    f"requested={getattr(judge,'requested_object',None)!r} vs "
+                    f"rendered={getattr(judge,'rendered_silhouette',None)!r} "
+                    f"— forcing retry"
+                )
+
+            if (judge.match_score >= JUDGE_MIN_SCORE and geom_ok
+                    and not iou_catastrophe and not category_mismatch):
                 log.info(f"[{job_id}] Judge passed at round {judge_round+1} (score={judge.match_score})")
+                # P3.2: carry the last-known critic verdict into the
+                # passing response so UX/clients see what was diagnosed
+                # on the failing rounds that led to this pass.
+                if last_critic_dict and response.critic is None:
+                    response.critic = last_critic_dict
                 # S3.1: cache a high-scoring success for future few-shot use.
                 try:
                     PATTERN_CACHE.record_success(req.prompt, code, judge.match_score)
@@ -2019,7 +2706,12 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
 
             # Rejected — remember and prepare retry.
             best_response = response
-            if not geom_ok and judge.match_score >= JUDGE_MIN_SCORE:
+            if iou_catastrophe and judge.match_score >= JUDGE_MIN_SCORE:
+                log.info(
+                    f"[{job_id}] Judge OK ({judge.match_score}) but IoU "
+                    f"catastrophe ({iou_value:.3f}), treating as rejection"
+                )
+            elif not geom_ok and judge.match_score >= JUDGE_MIN_SCORE:
                 log.info(
                     f"[{job_id}] Judge OK ({judge.match_score}) but geom_check FAIL "
                     f"({geom_result.fail_reason if geom_result else '?'}), "
@@ -2027,12 +2719,108 @@ async def _generate_impl(req: GenerateRequest, no_cache: bool = False,
                 )
             else:
                 log.info(f"[{job_id}] Judge rejected (score={judge.match_score} < {JUDGE_MIN_SCORE}), retrying...")
-            if judge_round < judge_rounds:
+
+            # P3.2: optionally call the vision critic. Fires on EVERY
+            # judge-fail (even the final exhausted round) so:
+            #   1. response.critic is populated for UX/debugging visibility
+            #   2. critic_block is available for retry_user when retries remain
+            # Skipped only when:
+            #   - flags off
+            #   - no reference image (image_grounded_mode disabled)
+            #   - IoU catastrophe (different, simpler retry hint — no point
+            #     asking the critic to enumerate parts of a silhouette
+            #     that's totally wrong)
+            critic_block = ""
+            if (FEATURE_IMAGE_CRITIC and FEATURE_IMAGE_GROUNDED
+                    and reference_path is not None
+                    and not iou_catastrophe):
+                cand_iso = OUTPUT_DIR / job_id / "views" / "iso.png"
+                if cand_iso.exists():
+                    log.info(
+                        f"[{job_id}] Calling vision critic "
+                        f"(round {judge_round+1}, IoU={iou_value:.3f})"
+                    )
+                    _critic_stats["calls_started"] += 1
+                    try:
+                        specs = _build_vision_specs()
+                        crit_result = await run_image_critic(
+                            reference_path=reference_path,
+                            candidate_path=cand_iso,
+                            user_description=req.prompt,
+                            vision_specs=specs,
+                        )
+                        critic_block = build_critic_retry_block(
+                            req.prompt, iou_value, crit_result,
+                        )
+                        last_critic_dict = crit_result.to_dict()
+                        response.critic = last_critic_dict
+                        log.info(
+                            f"[{job_id}] Critic verdict={crit_result.match_quality} "
+                            f"checks={len(crit_result.checks)} "
+                            f"complaints={len(crit_result.complaints)}"
+                        )
+                        # P3.2: account verdict if critic actually ran
+                        # (skip 'critic_unavailable' which means fallback
+                        # chain exhausted — that's a call_error, not a
+                        # real verdict).
+                        mq = crit_result.match_quality
+                        if mq == "critic_unavailable":
+                            _critic_stats["call_errors"] += 1
+                        else:
+                            _critic_stats["verdicts_returned"] += 1
+                            _critic_stats["verdict_distribution"][mq] = (
+                                _critic_stats["verdict_distribution"].get(mq, 0) + 1
+                            )
+                        await events.emit(
+                            "progress", stage="image_critic",
+                            status="done",
+                            verdict=crit_result.match_quality,
+                            complaints=len(crit_result.complaints),
+                            judge_round=judge_round + 1,
+                        )
+                    except Exception as e:
+                        log.warning(f"[{job_id}] critic call failed: {e}")
+                        _critic_stats["call_errors"] += 1
+
+            if (judge_round - gate_skips) < judge_rounds:
+                # Build the retry user message
+                retry_user = build_retry_instruction(req.prompt, code, judge)
+                if iou_catastrophe:
+                    # Catastrophe: silhouette is fundamentally wrong.
+                    # Tell the LLM the BIG-PICTURE silhouette is off; don't
+                    # bother with critic part-by-part complaints (which
+                    # presume the silhouette is roughly right).
+                    retry_user = (
+                        f"CRITICAL: the rendered model's silhouette "
+                        f"(IoU = {iou_value:.3f}) does not match the "
+                        f"target shape at all — fewer than "
+                        f"{int(IOU_CATASTROPHE_THRESHOLD * 100)}% pixel "
+                        f"overlap. The structure is fundamentally wrong. "
+                        f"Re-read the requested object name carefully and "
+                        f"start the design from scratch with the correct "
+                        f"overall proportions and orientation.\n\n"
+                        + retry_user
+                    )
+                elif critic_block:
+                    retry_user = critic_block + "\n\n" + retry_user
+
                 messages.append({"role": "assistant", "content": code})
-                messages.append({"role": "user", "content": build_retry_instruction(req.prompt, code, judge)})
+                messages.append({"role": "user", "content": retry_user})
+
+            # P3.3: bottom-of-loop increment for the while-loop. All
+            # `continue` paths above (gate-skips, exec retries) have
+            # already incremented judge_round before continuing, so
+            # this only runs on the natural fall-through after a judge
+            # eval (with or without a retry message having been queued).
+            judge_round += 1
 
         # All judge rounds exhausted; return the last (best-effort) response
         log.info(f"[{job_id}] Judge retries exhausted; returning last result")
+        # P3.2: ensure the latest critic verdict survives even if
+        # best_response was built from an earlier pre-critic round
+        # (e.g. round 0 stored before critic ran on round 1).
+        if best_response is not None and last_critic_dict and best_response.critic is None:
+            best_response.critic = last_critic_dict
         _finalize_generate(req, job_id, best_response, code if 'code' in dir() else "",
                            sys_prompt_for_cache, _start_ts,
                            exec_ok=best_response is not None, store_cache=False)
@@ -2298,13 +3086,23 @@ async def download(job_id: str, fmt: str = "stl"):
 
 @app.get("/api/thumbnail/{job_id}/{filename}")
 async def thumbnail(job_id: str, filename: str):
-    """Serve a rendered thumbnail PNG for the VLM judge visualisation."""
+    """Serve a rendered thumbnail PNG for the VLM judge visualisation.
+
+    Looks first in `<job>/views/` (rendered STL views) and falls back
+    to `<job>/` itself (P3.1: reference_iso.png from Flux-schnell lives
+    at the job root rather than inside views/).
+    """
     # Sanitize: only allow simple PNG filenames, no traversal
     if "/" in filename or ".." in filename or not filename.endswith(".png"):
         raise HTTPException(status_code=400, detail="invalid thumbnail filename")
     png_path = OUTPUT_DIR / job_id / "views" / filename
     if not png_path.exists():
-        raise HTTPException(status_code=404, detail="thumbnail not found")
+        # P3.1 fallback: reference image lives at job root
+        alt_path = OUTPUT_DIR / job_id / filename
+        if alt_path.exists():
+            png_path = alt_path
+        else:
+            raise HTTPException(status_code=404, detail="thumbnail not found")
     return FileResponse(png_path, media_type="image/png")
 
 
@@ -2377,10 +3175,24 @@ async def stats():
         log_agg = STRUCTURED_LOG.aggregate()
     except Exception as e:
         log_agg = {"error": str(e)}
+    # P3.2: critic + catastrophe stats. invocation_rate = how often the
+    # critic was actually consulted (proxy for "how many requests
+    # involved a judge-fail with reference image"). Fast-pass cases
+    # don't increment any of these counters.
+    cs = _critic_stats
+    critic_calls = cs["calls_started"]
+    critic_success_pct = (
+        100.0 * cs["verdicts_returned"] / critic_calls
+        if critic_calls else 0.0
+    )
     return {
         "failover": {
             **_failover_stats,
             "failover_pct": round(failover_pct, 2),
+        },
+        "critic": {
+            **cs,
+            "success_pct": round(critic_success_pct, 2),
         },
         "pattern_cache": {
             "categories": cache_size,
@@ -2400,12 +3212,17 @@ async def stats():
             "output_cache": FEATURE_OUTPUT_CACHE,
             "structured_log": FEATURE_STRUCTURED_LOG,
             "geom_check": FEATURE_GEOM_CHECK,
+            "plan_validator": FEATURE_PLAN_VALIDATOR,
+            "raised_part_gate": FEATURE_RAISED_PART_GATE,
             "print_readiness": FEATURE_PRINT_READINESS,
             "multi_format_export": FEATURE_MULTI_FORMAT_EXPORT,
             "sandbox_strict": FEATURE_SANDBOX_STRICT,
             "best_of_n": FEATURE_BEST_OF_N,
             "slicer_check": FEATURE_SLICER_CHECK,
             "render_pyvista": FEATURE_RENDER_PYVISTA,
+            "image_grounded_mode": FEATURE_IMAGE_GROUNDED,
+            "image_critic_mode": FEATURE_IMAGE_CRITIC,
+            "iou_catastrophe_threshold": IOU_CATASTROPHE_THRESHOLD,
         },
         "backend": BACKEND,
     }
